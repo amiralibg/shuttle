@@ -54,5 +54,9 @@ let package = Package(
             name: "ShuttleCoreTests",
             dependencies: ["ShuttleCore"]
         ),
+        .testTarget(
+            name: "ShuttleScrollerTests",
+            dependencies: ["ShuttleScroller", "ShuttleCore"]
+        ),
     ]
 )
