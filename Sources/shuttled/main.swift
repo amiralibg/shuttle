@@ -20,6 +20,7 @@ final class DaemonController: @unchecked Sendable {
     private let scroller: Scroller
     private let coordinator: WindowCoordinator
     private var viewport: Frame
+    var onShutdown: (@Sendable () -> Void)?
 
     init(initialStrip: Strip, initialSpaceID: SpaceID, scroller: Scroller, coordinator: WindowCoordinator, viewport: Frame) {
         self.strips[initialSpaceID] = initialStrip
@@ -294,6 +295,12 @@ final class DaemonController: @unchecked Sendable {
         let verb = parts.first ?? ""
 
         switch verb {
+        case "stop", "quit", "exit":
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                self?.onShutdown?()
+            }
+            return "OK: Shutting down shuttled daemon..."
+
         case "space":
             guard parts.count >= 3 else { return "ERR: Usage: space focus <1..9> or space move-window <1..9>" }
             let action = parts[1]
@@ -502,6 +509,10 @@ guard AXIsProcessTrusted() else {
     exit(1)
 }
 
+// 0. Load Configuration
+let config = ShuttleConfig.load()
+print("⚙️  Loaded configuration (gap: \(config.gap)pt, spring omega: \(config.springOmega), mouse mod: \(config.mouseModifier))")
+
 // 1. Resolve Display Viewport and Active Space
 let displays = SpaceControl.displayLayout()
 let viewport: Frame = displays.first?.visible ?? Frame(x: 0, y: 0, width: 1710, height: 1112)
@@ -512,8 +523,8 @@ print("Active Space ID: \(initialSpaceID)")
 
 // 2. Discover Running Windows
 var initialStrip = Strip()
-let scroller = Scroller(strategy: .hybrid)
-let coordinator = WindowCoordinator(scroller: scroller, gap: 16.0)
+let scroller = Scroller(strategy: .hybrid, omega: config.springOmega)
+let coordinator = WindowCoordinator(scroller: scroller, gap: config.gap)
 
 let runningApps = NSWorkspace.shared.runningApplications.filter {
     $0.activationPolicy == .regular && $0.bundleIdentifier != Bundle.main.bundleIdentifier
@@ -595,41 +606,10 @@ observers.watch(pids: initialPids, windows: initialWindows)
 print("👁️  Dynamic window lifecycle observers attached.")
 
 // 4. Keyboard Navigation Setup (InputManager)
-var binds: [(String, String)] = [
-    // Column focus
-    ("alt-h", "column focus-left"),
-    ("alt-l", "column focus-right"),
-    ("alt-left", "column focus-left"),
-    ("alt-right", "column focus-right"),
-
-    // Vertical stack focus
-    ("alt-k", "window focus-up"),
-    ("alt-j", "window focus-down"),
-    ("alt-up", "window focus-up"),
-    ("alt-down", "window focus-down"),
-
-    // Column move
-    ("alt-shift-h", "column move-left"),
-    ("alt-shift-l", "column move-right"),
-    ("alt-shift-left", "column move-left"),
-    ("alt-shift-right", "column move-right"),
-
-    // Vertical stack move
-    ("alt-shift-k", "window move-up"),
-    ("alt-shift-j", "window move-down"),
-    ("alt-shift-up", "window move-up"),
-    ("alt-shift-down", "window move-down"),
-
-    // Column width adjustment & presets
-    ("alt-minus", "column shrink"),
-    ("alt-equal", "column expand"),
-    ("alt-r", "column preset"),
-    ("alt-f", "column maximize"),
-    ("alt-0", "column center"),
-
-    // Stacking and splitting
-    ("alt-s", "window split"),
-]
+var binds: [(String, String)] = []
+for (k, v) in config.keybindings {
+    binds.append((k, v))
+}
 
 // Spaces bindings: Alt + 1..9 (switch) & Alt + Shift + 1..9 (move window)
 for i in 1...9 {
@@ -646,7 +626,7 @@ for (chordStr, cmdStr) in binds {
 
 let keymap = Keymap(modes: ["default": chordMap])
 let inputManager = InputManager(keymap: keymap)
-inputManager.updateMouseModifier("alt")
+inputManager.updateMouseModifier(config.mouseModifier)
 
 inputManager.onCommand = { cmd in
     let res = controller.handleCommand(cmd)
@@ -677,6 +657,7 @@ if inputManager.start() {
 // 5. IPC Server for Remote Control (shuttlectl)
 let user = ProcessInfo.processInfo.environment["USER"] ?? "user"
 let socketPath = "/tmp/shuttle-\(user).sock"
+unlink(socketPath)
 ignoreSIGPIPE()
 
 let ipcServer = IPCServer(path: socketPath) { [controller] line, conn in
@@ -695,7 +676,27 @@ DispatchQueue.global(qos: .userInteractive).async {
     ipcServer.run()
 }
 
-// 6. 120Hz/60Hz Animation Simulation Timer
+// 6. Graceful Shutdown & Signal Handling
+@Sendable func performShutdown() {
+    print("\n🛑 Shutting down Shuttle daemon...")
+    unlink(socketPath)
+    exit(0)
+}
+
+controller.onShutdown = performShutdown
+
+signal(SIGINT, SIG_IGN)
+signal(SIGTERM, SIG_IGN)
+
+let sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+sigintSource.setEventHandler { performShutdown() }
+sigintSource.resume()
+
+let sigtermSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+sigtermSource.setEventHandler { performShutdown() }
+sigtermSource.resume()
+
+// 7. 120Hz/60Hz Animation Simulation Timer
 let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.main)
 timer.schedule(deadline: .now(), repeating: .milliseconds(8)) // ~120Hz tick
 var lastTick = CACurrentMediaTime()

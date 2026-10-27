@@ -1,22 +1,17 @@
 import Foundation
-import CoreGraphics
 import ShuttleCore
-import WeftCore
-import WeftPlatform
 
-/// Rendering strategy chosen based on empirical spike benchmarking.
+/// Renders scroller animation transitions between ribbon offsets.
 public enum RenderStrategy: Equatable, Sendable {
-    /// Direct Accessibility position writes with frame interval pacing.
-    case directAX(throttleMs: Double = 16.0)
-    /// Atomic WindowServer transaction batching via SkyLight private shims.
-    case skyLightBatch
-    /// ScreenCaptureKit live proxy streaming into overlay layers (for continuous trackpad ribbons).
-    case proxyOverlay
-    /// Hybrid pipeline: 0ms direct AX / SkyLight for keyboard steps + warm proxy for gestures.
+    /// ScreenCaptureKit live window stream texture rendering.
+    case screenCaptureKit
+    /// Direct Accessibility frame placement with optional throttling interval.
+    case directAX(throttleMs: Double)
+    /// Direct AX for settled states, throttled AX for active spring animations.
     case hybrid
 }
 
-/// Manages horizontal ribbon scroll position, critically damped spring physics, and focus coordination.
+/// Computes critically damped spring physics and manages scrolling offset transitions.
 public final class Scroller: @unchecked Sendable {
     public private(set) var targetOffset: Double = 0.0
     public private(set) var currentOffset: Double = 0.0
@@ -31,8 +26,9 @@ public final class Scroller: @unchecked Sendable {
 
     private let lock = NSLock()
 
-    public init(strategy: RenderStrategy = .hybrid) {
+    public init(strategy: RenderStrategy = .hybrid, omega: Double = 26.0) {
         self.strategy = strategy
+        self.omega = omega
     }
 
     /// Explicitly sets current and target offsets (e.g. initial setup or instant jump).
@@ -45,7 +41,7 @@ public final class Scroller: @unchecked Sendable {
         isSettled = true
     }
 
-    /// Continuous scroll offset increment (e.g. from trackpad or mouse wheel event).
+    /// Applies an immediate offset delta (e.g. for trackpad scroll wheel interaction).
     public func scroll(by delta: Double) {
         lock.lock()
         defer { lock.unlock() }
@@ -53,166 +49,170 @@ public final class Scroller: @unchecked Sendable {
         isSettled = false
     }
 
-    /// Interactive 1:1 pan (e.g. trackpad two-finger drag or mouse ribbon drag).
+    // MARK: - Interactive Gestures & Inertia
+
+    /// Interactive 1:1 pan (e.g. trackpad two-finger drag or mouse drag).
     public func pan(delta: Double, in strip: Strip, viewportWidth: Double, gap: Double) {
         lock.lock()
         defer { lock.unlock() }
 
-        var effectiveDelta = delta
-        // Apply rubber-band resistance when pulling beyond bounds
+        var newOffset = currentOffset + delta
+
+        // Rubber-band resistance if panning beyond ribbon bounds
         if let bounds = strip.centerOffsetBounds(viewportWidth: viewportWidth, gap: gap) {
-            if currentOffset < bounds.min && delta < 0 {
-                let overscroll = bounds.min - currentOffset
-                let dampening = max(0.1, 1.0 / (1.0 + overscroll * 0.005))
-                effectiveDelta *= dampening
-            } else if currentOffset > bounds.max && delta > 0 {
-                let overscroll = currentOffset - bounds.max
-                let dampening = max(0.1, 1.0 / (1.0 + overscroll * 0.005))
-                effectiveDelta *= dampening
+            if newOffset < bounds.min {
+                let overscroll = bounds.min - newOffset
+                newOffset = bounds.min - (overscroll * 0.35)
+            } else if newOffset > bounds.max {
+                let overscroll = newOffset - bounds.max
+                newOffset = bounds.max + (overscroll * 0.35)
             }
         }
 
-        currentOffset += effectiveDelta
-        targetOffset = currentOffset
+        currentOffset = newOffset
+        targetOffset = newOffset
         velocity = 0.0
         isSettled = false
     }
 
-    /// Snaps ribbon to center the column closest to current viewport position.
+    /// Snaps the ribbon to the nearest column center based on current offset.
     @discardableResult
     public func snapToNearest(in strip: inout Strip, viewportWidth: Double, gap: Double) -> Bool {
         lock.lock()
         defer { lock.unlock() }
 
-        guard let nearest = strip.nearestColumnIndex(forRibbonOffset: currentOffset, viewportWidth: viewportWidth, gap: gap) else {
+        guard let nearestIdx = strip.nearestColumnIndex(forRibbonOffset: currentOffset, viewportWidth: viewportWidth, gap: gap) else {
             return false
         }
-
-        _ = strip.focusColumn(at: nearest)
-        if let center = strip.centerOffset(forColumnAt: nearest, viewportWidth: viewportWidth, gap: gap) {
-            targetOffset = center
+        strip.focusedColumnIndex = nearestIdx
+        if let target = strip.centerOffset(forColumnAt: nearestIdx, viewportWidth: viewportWidth, gap: gap) {
+            targetOffset = target
             isSettled = false
             return true
         }
         return false
     }
 
-    /// Applies inertial fling from gesture velocity, projecting rest position and snapping to the nearest column.
+    /// High-velocity fling with kinetic friction projection.
     public func fling(initialVelocity: Double, in strip: inout Strip, viewportWidth: Double, gap: Double) {
         lock.lock()
         defer { lock.unlock() }
 
-        velocity = initialVelocity
-        // Project stopping position assuming exponential friction deceleration
-        let friction = 8.0
-        let projectedOffset = currentOffset + (initialVelocity / friction)
+        // Kinetic friction factor (~0.85 decaying over time)
+        let projectedTravel = initialVelocity * 0.125
+        let projectedOffset = currentOffset + projectedTravel
 
-        if let targetIdx = strip.nearestColumnIndex(forRibbonOffset: projectedOffset, viewportWidth: viewportWidth, gap: gap),
-           let center = strip.centerOffset(forColumnAt: targetIdx, viewportWidth: viewportWidth, gap: gap) {
-            _ = strip.focusColumn(at: targetIdx)
-            targetOffset = center
+        if let nearestIdx = strip.nearestColumnIndex(forRibbonOffset: projectedOffset, viewportWidth: viewportWidth, gap: gap),
+           let target = strip.centerOffset(forColumnAt: nearestIdx, viewportWidth: viewportWidth, gap: gap) {
+            strip.focusedColumnIndex = nearestIdx
+            targetOffset = target
+            velocity = initialVelocity * 0.5
             isSettled = false
+        } else {
+            snapToColumn(at: strip.focusedColumnIndex, in: strip, viewportWidth: viewportWidth, gap: gap)
         }
     }
 
-    /// Snaps viewport target offset to center the column at `index`.
-    public func snapToColumn(at index: Int, in strip: Strip, viewportWidth: Double, gap: Double) {
-        lock.lock()
-        defer { lock.unlock() }
-        if let center = strip.centerOffset(forColumnAt: index, viewportWidth: viewportWidth, gap: gap) {
-            targetOffset = center
-            isSettled = false
-        }
-    }
+    // MARK: - Keyboard Column Navigation
 
-    // MARK: - Keyboard Navigation Commands
-
-    /// Navigates focus to the column on the left and animates viewport to center it.
-    @discardableResult
+    /// Animates focus to the column on the left.
     public func focusLeft(in strip: inout Strip, viewportWidth: Double, gap: Double) -> Bool {
         lock.lock()
         defer { lock.unlock() }
+
         guard strip.focusLeft() else { return false }
-        if let center = strip.centerOffset(forColumnAt: strip.focusedColumnIndex, viewportWidth: viewportWidth, gap: gap) {
-            targetOffset = center
+        if let target = strip.centerOffset(forColumnAt: strip.focusedColumnIndex, viewportWidth: viewportWidth, gap: gap) {
+            targetOffset = target
             isSettled = false
         }
         return true
     }
 
-    /// Navigates focus to the column on the right and animates viewport to center it.
-    @discardableResult
+    /// Animates focus to the column on the right.
     public func focusRight(in strip: inout Strip, viewportWidth: Double, gap: Double) -> Bool {
         lock.lock()
         defer { lock.unlock() }
+
         guard strip.focusRight() else { return false }
-        if let center = strip.centerOffset(forColumnAt: strip.focusedColumnIndex, viewportWidth: viewportWidth, gap: gap) {
-            targetOffset = center
+        if let target = strip.centerOffset(forColumnAt: strip.focusedColumnIndex, viewportWidth: viewportWidth, gap: gap) {
+            targetOffset = target
             isSettled = false
         }
         return true
     }
 
-    /// Focuses arbitrary column and animates viewport.
-    @discardableResult
+    /// Animates focus to a specific column index.
     public func focusColumn(at index: Int, in strip: inout Strip, viewportWidth: Double, gap: Double) -> Bool {
         lock.lock()
         defer { lock.unlock() }
+
         guard strip.focusColumn(at: index) else { return false }
-        if let center = strip.centerOffset(forColumnAt: strip.focusedColumnIndex, viewportWidth: viewportWidth, gap: gap) {
-            targetOffset = center
+        if let target = strip.centerOffset(forColumnAt: strip.focusedColumnIndex, viewportWidth: viewportWidth, gap: gap) {
+            targetOffset = target
             isSettled = false
         }
         return true
     }
 
-    /// Expands focused column width and recenters viewport.
+    /// Snaps instantly or smoothly centers a column.
+    public func snapToColumn(at index: Int, in strip: Strip, viewportWidth: Double, gap: Double) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if let target = strip.centerOffset(forColumnAt: index, viewportWidth: viewportWidth, gap: gap) {
+            targetOffset = target
+            isSettled = false
+        }
+    }
+
+    /// Expands focused column and smoothly centers it.
     public func expandFocusedColumn(in strip: inout Strip, by delta: Double = 0.1, viewportWidth: Double, gap: Double) {
         lock.lock()
         defer { lock.unlock() }
+
         strip.expandFocusedColumn(by: delta, viewportWidth: viewportWidth)
-        if let center = strip.centerOffset(forColumnAt: strip.focusedColumnIndex, viewportWidth: viewportWidth, gap: gap) {
-            targetOffset = center
+        if let target = strip.centerOffset(forColumnAt: strip.focusedColumnIndex, viewportWidth: viewportWidth, gap: gap) {
+            targetOffset = target
             isSettled = false
         }
     }
 
-    /// Shrinks focused column width and recenters viewport.
+    /// Shrinks focused column and smoothly centers it.
     public func shrinkFocusedColumn(in strip: inout Strip, by delta: Double = 0.1, viewportWidth: Double, gap: Double) {
         lock.lock()
         defer { lock.unlock() }
+
         strip.shrinkFocusedColumn(by: delta, viewportWidth: viewportWidth)
-        if let center = strip.centerOffset(forColumnAt: strip.focusedColumnIndex, viewportWidth: viewportWidth, gap: gap) {
-            targetOffset = center
+        if let target = strip.centerOffset(forColumnAt: strip.focusedColumnIndex, viewportWidth: viewportWidth, gap: gap) {
+            targetOffset = target
             isSettled = false
         }
     }
 
-    // MARK: - Physics Simulation Step
+    // MARK: - Simulation Tick
 
-    /// Advances the critically damped spring towards `targetOffset` by `dt` seconds.
+    /// Advances the spring simulation by dt seconds using an analytical critically damped spring solver.
     public func tick(dt: Double) {
         lock.lock()
         defer { lock.unlock() }
+
         guard !isSettled else { return }
 
-        let clampedDt = min(max(dt, 0.0), 0.05) // clamp max timestep to 50ms
-        let w = omega
-        let e = exp(-w * clampedDt)
+        let displacement = currentOffset - targetOffset
+        let c = velocity + omega * displacement
+        let expTerm = exp(-omega * dt)
 
-        let x0 = currentOffset - targetOffset
-        let c = velocity + w * x0
+        let newDisplacement = (displacement + c * dt) * expTerm
+        let newVelocity = (velocity - c * omega * dt) * expTerm
 
-        let nextOffset = targetOffset + (x0 + c * clampedDt) * e
-        let nextVelocity = (velocity - w * c * clampedDt) * e
+        currentOffset = targetOffset + newDisplacement
+        velocity = newVelocity
 
-        if abs(nextOffset - targetOffset) < 0.5 && abs(nextVelocity) < 2.0 {
+        // Settle when within 0.25pt and velocity < 5pt/s
+        if abs(newDisplacement) < 0.25 && abs(newVelocity) < 5.0 {
             currentOffset = targetOffset
             velocity = 0.0
             isSettled = true
-        } else {
-            currentOffset = nextOffset
-            velocity = nextVelocity
         }
     }
 }

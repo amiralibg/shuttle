@@ -43,8 +43,9 @@ guard let _ = args.first else {
       space focus <N>    Switch to macOS Space N (1..9) via synthetic Dock swipe
       space move <N>     Move focused window to macOS Space N (1..9)
 
-    STATUS:
+    DAEMON & STATUS:
       status             Query active space, columns, focused window, and scroller status
+      stop               Gracefully shut down the running shuttled daemon
     """)
     exit(0)
 }
