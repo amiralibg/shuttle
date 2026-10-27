@@ -292,7 +292,49 @@ final class DaemonController: @unchecked Sendable {
     func handleCommand(_ command: String) -> String {
         let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
         let parts = trimmed.split(separator: " ").map(String.init)
-        let verb = parts.first ?? ""
+        guard let rawVerb = parts.first else { return "ERR: Empty command" }
+
+        // Canonicalize short command aliases
+        let verb: String
+        let sub: String
+
+        switch rawVerb {
+        case "focus-left", "left", "west":
+            verb = "column"; sub = "focus-left"
+        case "focus-right", "right", "east":
+            verb = "column"; sub = "focus-right"
+        case "move-left":
+            verb = "column"; sub = "move-left"
+        case "move-right":
+            verb = "column"; sub = "move-right"
+        case "preset", "cycle":
+            verb = "column"; sub = "preset"
+        case "maximize", "fullscreen":
+            verb = "column"; sub = "maximize"
+        case "expand":
+            verb = "column"; sub = "expand"
+        case "shrink":
+            verb = "column"; sub = "shrink"
+        case "center":
+            verb = "column"; sub = "center"
+        case "focus-up", "up", "north":
+            verb = "window"; sub = "focus-up"
+        case "focus-down", "down", "south":
+            verb = "window"; sub = "focus-down"
+        case "move-up":
+            verb = "window"; sub = "move-up"
+        case "move-down":
+            verb = "window"; sub = "move-down"
+        case "split":
+            verb = "window"; sub = "split"
+        case "consume-left":
+            verb = "column"; sub = "consume-left"
+        case "consume-right":
+            verb = "column"; sub = "consume-right"
+        default:
+            verb = rawVerb
+            sub = parts.dropFirst().joined(separator: " ")
+        }
 
         switch verb {
         case "stop", "quit", "exit":
@@ -316,7 +358,6 @@ final class DaemonController: @unchecked Sendable {
             lock.lock()
             defer { lock.unlock() }
             var strip = currentStrip
-            let sub = parts.dropFirst().joined(separator: " ")
             if sub == "focus-up" || sub == "up" || sub == "north" {
                 let ok = strip.focusUp()
                 if ok {
@@ -360,7 +401,6 @@ final class DaemonController: @unchecked Sendable {
             lock.lock()
             defer { lock.unlock() }
             var strip = currentStrip
-            let sub = parts.dropFirst().joined(separator: " ")
             if sub == "focus-left" || sub == "left" || sub == "west" {
                 let ok = scroller.focusLeft(in: &strip, viewportWidth: viewport.width, gap: coordinator.gap)
                 currentStrip = strip
@@ -496,6 +536,74 @@ final class DaemonController: @unchecked Sendable {
     }
 }
 
+// MARK: - Menu Bar Controller
+
+final class MenuBarController: NSObject, @unchecked Sendable {
+    private var statusItem: NSStatusItem?
+    private let controller: DaemonController
+
+    init(controller: DaemonController) {
+        self.controller = controller
+        super.init()
+        setupMenu()
+    }
+
+    func setupMenu() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+            if let button = item.button {
+                button.title = " 🚀 Shuttle "
+                button.toolTip = "Shuttle - Infinite Horizontal Ribbon Window Manager"
+            }
+
+            let menu = NSMenu()
+            let titleItem = NSMenuItem(title: "Shuttle v\(ShuttleVersion.full) (Active)", action: nil, keyEquivalent: "")
+            titleItem.isEnabled = false
+            menu.addItem(titleItem)
+            menu.addItem(NSMenuItem.separator())
+
+            let centerItem = NSMenuItem(title: "Center Focused Column", action: #selector(self.centerColumn), keyEquivalent: "0")
+            centerItem.target = self
+            menu.addItem(centerItem)
+
+            let presetItem = NSMenuItem(title: "Cycle Column Width Preset", action: #selector(self.cyclePreset), keyEquivalent: "r")
+            presetItem.target = self
+            menu.addItem(presetItem)
+
+            let configItem = NSMenuItem(title: "Open Configuration...", action: #selector(self.openConfig), keyEquivalent: ",")
+            configItem.target = self
+            menu.addItem(configItem)
+
+            menu.addItem(NSMenuItem.separator())
+
+            let quitItem = NSMenuItem(title: "Quit Shuttle", action: #selector(self.quitApp), keyEquivalent: "q")
+            quitItem.target = self
+            menu.addItem(quitItem)
+
+            item.menu = menu
+            self.statusItem = item
+        }
+    }
+
+    @objc func centerColumn() {
+        _ = controller.handleCommand("column center")
+    }
+
+    @objc func cyclePreset() {
+        _ = controller.handleCommand("column preset")
+    }
+
+    @objc func openConfig() {
+        let url = ShuttleConfig.defaultConfigFileURL()
+        NSWorkspace.shared.open(url)
+    }
+
+    @objc func quitApp() {
+        controller.onShutdown?()
+    }
+}
+
 // MARK: - Startup
 
 print("==================================================================")
@@ -503,9 +611,16 @@ print("  SHUTTLE DAEMON (shuttled v\(ShuttleVersion.full))")
 print("  Infinite Horizontal Ribbon Scrolling Window Manager for macOS")
 print("==================================================================")
 
-guard AXIsProcessTrusted() else {
+// Ensure accessibility check with prompt if not trusted
+let options = [("AXTrustedCheckOptionPrompt" as CFString): true] as CFDictionary
+let trustedCheck = AXIsProcessTrustedWithOptions(options)
+
+guard trustedCheck else {
     print("❌ Accessibility permissions not granted.")
-    print("Please grant Accessibility in System Settings -> Privacy & Security -> Accessibility.")
+    print("Opening System Settings -> Privacy & Security -> Accessibility...")
+    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+        NSWorkspace.shared.open(url)
+    }
     exit(1)
 }
 
@@ -571,6 +686,9 @@ let controller = DaemonController(
     coordinator: coordinator,
     viewport: viewport
 )
+
+// 2.5 Initialize Menu Bar Item
+let menuBar = MenuBarController(controller: controller)
 
 // 3. Dynamic Window & Space Lifecycle Observers
 let observers = ObserverSet()

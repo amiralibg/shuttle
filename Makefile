@@ -26,7 +26,8 @@ app: release
 	@mkdir -p "$(APP_DIR)/Contents/Resources"
 	@cp -f .build/release/shuttled "$(APP_DIR)/Contents/MacOS/shuttled"
 	@cp -f extra/Info.plist "$(APP_DIR)/Contents/Info.plist"
-	@echo "✅ Shuttle.app created at $(APP_DIR)"
+	@codesign --force --deep --sign - "$(APP_DIR)"
+	@echo "✅ Shuttle.app created and ad-hoc signed at $(APP_DIR)"
 
 install: release app
 	@echo "🚀 Installing shuttled and shuttlectl to $(BINDIR)..."
