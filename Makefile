@@ -3,7 +3,7 @@ BINDIR ?= $(PREFIX)/bin
 APP_DIR ?= $(HOME)/Applications/Shuttle.app
 LAUNCH_AGENTS_DIR ?= $(HOME)/Library/LaunchAgents
 
-.PHONY: all build release test clean install uninstall app
+.PHONY: all build release test clean install uninstall run app
 
 all: build
 
@@ -30,21 +30,11 @@ app: release
 	@echo "✅ Shuttle.app created and ad-hoc signed at $(APP_DIR)"
 
 install: release app
-	@echo "🚀 Installing shuttled and shuttlectl to $(BINDIR)..."
-	@mkdir -p $(BINDIR)
-	@cp -f .build/release/shuttled $(BINDIR)/shuttled
-	@cp -f .build/release/shuttlectl $(BINDIR)/shuttlectl
-	@chmod +x $(BINDIR)/shuttled $(BINDIR)/shuttlectl
-	@mkdir -p $(HOME)/.config/shuttle
-	@echo "✅ Binaries installed."
-	@echo "To grant Accessibility permissions:"
-	@echo "  Open 'System Settings' -> 'Privacy & Security' -> 'Accessibility'"
-	@echo "  Add and toggle ON '$(APP_DIR)' (or your terminal application)."
+	@echo "🚀 Installing shuttled and shuttlectl..."
+	@./scripts/install-and-run.sh
+
+run:
+	@./scripts/install-and-run.sh
 
 uninstall:
-	@echo "🗑️  Uninstalling Shuttle..."
-	@rm -f $(BINDIR)/shuttled
-	@rm -f $(BINDIR)/shuttlectl
-	@rm -rf "$(APP_DIR)"
-	@rm -f "$(LAUNCH_AGENTS_DIR)/com.amiralibg.shuttle.plist"
-	@echo "✅ Uninstalled successfully."
+	@./scripts/uninstall.sh
