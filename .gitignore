@@ -1,0 +1,22 @@
+# SwiftPM
+.build/
+.swiftpm/
+
+# Build products
+build/
+*.dSYM/
+*.o
+
+# Compiled spike binaries
+spikes/*
+!spikes/*.swift
+!spikes/*.md
+!spikes/build.sh
+
+# Xcode
+DerivedData/
+xcuserdata/
+*.xcuserstate
+
+# macOS
+.DS_Store
