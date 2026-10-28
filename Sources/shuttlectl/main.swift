@@ -20,7 +20,8 @@ guard let _ = args.first else {
       move-left          Move focused column to the left
       move-right         Move focused column to the right
       preset             Cycle column width preset (1/3 -> 1/2 -> 2/3 -> 1.0)
-      maximize           Toggle full viewport width for focused column
+      maximize           Toggle full width for focused column (gaps kept)
+      fullscreen         Toggle fullscreen for the focused window (whole display, no gaps)
       expand             Expand width of focused column (+10%)
       shrink             Shrink width of focused column (-10%)
       center             Snap ribbon to center focused column
@@ -40,17 +41,46 @@ guard let _ = args.first else {
       snap               Snap ribbon to nearest column
 
     SPACE (DESKTOP) COMMANDS:
-      space focus <N>    Switch to macOS Space N (1..9) via synthetic Dock swipe
-      space move <N>     Move focused window to macOS Space N (1..9)
+      space focus <D>    Show desktop D: a number (main display's desktops first), a [[space]] label,
+                         next, prev, or recent. Instant SkyLight switch, Dock swipe fallback.
+      space move <D> [--follow]
+                         Send the focused window to desktop D; --follow goes with it
+
+    APP & WINDOW:
+      window float       Float the focused window, or tile a floating one again
+      app toggle <ID>    Show, hide or launch the app with bundle id ID
+
+    DISPLAY COMMANDS (DIR: left right up down next prev):
+      monitor focus <DIR>        Focus the display that way
+      monitor move-column <DIR>  Move the focused column to that display, focus follows
+      monitor move-window <DIR>  Move only the focused window to that display
 
     DAEMON & STATUS:
-      status             Query active space, columns, focused window, and scroller status
+      status             Query active desktop, columns, focused window, and scroller status (JSON)
+      refresh            Put every window back into its column: forget closed windows, pick up
+                         missed ones, re-read displays, rewrite every frame
+      refresh reset      The same, and reset every column to the default width
+      reload             Re-read ~/.config/shuttle/config.toml (also happens on save)
+      check              Parse the config file and list problems (no daemon needed)
       stop               Gracefully shut down the running shuttled daemon
     """)
     exit(0)
 }
 
 let command = args.joined(separator: " ")
+
+// Checked here, not by the daemon: works when shuttled is not running.
+if command == "check" {
+    let url = ShuttleConfig.defaultConfigFileURL()
+    let (config, warnings) = ShuttleConfig.loadReport(from: url)
+    print("\(url.path): \(config.keybindings.count) bindings, \(config.modes.count) mode(s), \(config.spaceLabels.count) desktop names, \(config.rules.count) rules")
+    if warnings.isEmpty {
+        print("✅ No problems found")
+        exit(0)
+    }
+    warnings.forEach { print("⚠️  \($0)") }
+    exit(1)
+}
 
 // Connect to Unix domain socket
 let fd = socket(AF_UNIX, SOCK_STREAM, 0)

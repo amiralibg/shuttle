@@ -4,6 +4,8 @@
 <dict>
     <key>CFBundleExecutable</key>
     <string>shuttled</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>com.amiralibg.shuttle</string>
     <key>CFBundleName</key>

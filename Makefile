@@ -3,7 +3,7 @@ BINDIR ?= $(PREFIX)/bin
 APP_DIR ?= $(HOME)/Applications/Shuttle.app
 LAUNCH_AGENTS_DIR ?= $(HOME)/Library/LaunchAgents
 
-.PHONY: all build release test clean install uninstall run app
+.PHONY: all build release test clean install uninstall run app icon
 
 all: build
 
@@ -26,7 +26,8 @@ app: release
 	@mkdir -p "$(APP_DIR)/Contents/Resources"
 	@cp -f .build/release/shuttled "$(APP_DIR)/Contents/MacOS/shuttled"
 	@cp -f extra/Info.plist "$(APP_DIR)/Contents/Info.plist"
-	@codesign --force --deep --sign - "$(APP_DIR)"
+	@cp -f extra/AppIcon.icns "$(APP_DIR)/Contents/Resources/AppIcon.icns"
+	@codesign --force --deep --sign "$${SHUTTLE_SIGN_IDENTITY:--}" "$(APP_DIR)"
 	@echo "✅ Shuttle.app created and ad-hoc signed at $(APP_DIR)"
 
 install: release app
@@ -38,3 +39,6 @@ run:
 
 uninstall:
 	@./scripts/uninstall.sh
+
+icon:
+	swift scripts/make-icon.swift

@@ -24,11 +24,37 @@ public final class Scroller: @unchecked Sendable {
     /// Rendering pipeline strategy.
     public var strategy: RenderStrategy = .hybrid
 
+    /// Whether focusing a column centers it or only scrolls it into view.
+    public var centerMode: CenterMode = .always
+
     private let lock = NSLock()
 
-    public init(strategy: RenderStrategy = .hybrid, omega: Double = 26.0) {
+    public init(strategy: RenderStrategy = .hybrid, omega: Double = 26.0, centerMode: CenterMode = .always) {
         self.strategy = strategy
         self.omega = omega
+        self.centerMode = centerMode
+    }
+
+    /// Where the ribbon should head to show column `index`, under `centerMode`.
+    /// Measured from `targetOffset`, so repeated key presses compose. Caller holds the lock.
+    private func focusTarget(forColumnAt index: Int, in strip: Strip, viewportWidth: Double, gap: Double) -> Double? {
+        // A desktop's only column sits in the middle, whatever the mode.
+        if strip.columns.count == 1 {
+            return strip.centerOffset(forColumnAt: index, viewportWidth: viewportWidth, gap: gap)
+        }
+        switch centerMode {
+        case .always:
+            return strip.centerOffset(forColumnAt: index, viewportWidth: viewportWidth, gap: gap)
+        case .never:
+            return strip.revealOffset(forColumnAt: index, currentOffset: targetOffset, viewportWidth: viewportWidth, gap: gap)
+        }
+    }
+
+    /// Caller holds the lock.
+    private func head(to target: Double?) {
+        guard let target else { return }
+        targetOffset = target
+        if abs(target - currentOffset) > 0.25 || abs(velocity) > 0 { isSettled = false }
     }
 
     /// Explicitly sets current and target offsets (e.g. initial setup or instant jump).
@@ -84,7 +110,7 @@ public final class Scroller: @unchecked Sendable {
         guard let nearestIdx = strip.nearestColumnIndex(forRibbonOffset: currentOffset, viewportWidth: viewportWidth, gap: gap) else {
             return false
         }
-        strip.focusedColumnIndex = nearestIdx
+        strip.focusColumn(at: nearestIdx)
         if let target = strip.centerOffset(forColumnAt: nearestIdx, viewportWidth: viewportWidth, gap: gap) {
             targetOffset = target
             isSettled = false
@@ -104,12 +130,14 @@ public final class Scroller: @unchecked Sendable {
 
         if let nearestIdx = strip.nearestColumnIndex(forRibbonOffset: projectedOffset, viewportWidth: viewportWidth, gap: gap),
            let target = strip.centerOffset(forColumnAt: nearestIdx, viewportWidth: viewportWidth, gap: gap) {
-            strip.focusedColumnIndex = nearestIdx
+            strip.focusColumn(at: nearestIdx)
             targetOffset = target
             velocity = initialVelocity * 0.5
             isSettled = false
-        } else {
-            snapToColumn(at: strip.focusedColumnIndex, in: strip, viewportWidth: viewportWidth, gap: gap)
+        } else if let target = strip.centerOffset(forColumnAt: strip.focusedColumnIndex, viewportWidth: viewportWidth, gap: gap) {
+            // Calling snapToColumn here would re-take the non-recursive lock.
+            targetOffset = target
+            isSettled = false
         }
     }
 
@@ -121,10 +149,7 @@ public final class Scroller: @unchecked Sendable {
         defer { lock.unlock() }
 
         guard strip.focusLeft() else { return false }
-        if let target = strip.centerOffset(forColumnAt: strip.focusedColumnIndex, viewportWidth: viewportWidth, gap: gap) {
-            targetOffset = target
-            isSettled = false
-        }
+        head(to: focusTarget(forColumnAt: strip.focusedColumnIndex, in: strip, viewportWidth: viewportWidth, gap: gap))
         return true
     }
 
@@ -134,10 +159,7 @@ public final class Scroller: @unchecked Sendable {
         defer { lock.unlock() }
 
         guard strip.focusRight() else { return false }
-        if let target = strip.centerOffset(forColumnAt: strip.focusedColumnIndex, viewportWidth: viewportWidth, gap: gap) {
-            targetOffset = target
-            isSettled = false
-        }
+        head(to: focusTarget(forColumnAt: strip.focusedColumnIndex, in: strip, viewportWidth: viewportWidth, gap: gap))
         return true
     }
 
@@ -147,46 +169,40 @@ public final class Scroller: @unchecked Sendable {
         defer { lock.unlock() }
 
         guard strip.focusColumn(at: index) else { return false }
-        if let target = strip.centerOffset(forColumnAt: strip.focusedColumnIndex, viewportWidth: viewportWidth, gap: gap) {
-            targetOffset = target
-            isSettled = false
-        }
+        head(to: focusTarget(forColumnAt: strip.focusedColumnIndex, in: strip, viewportWidth: viewportWidth, gap: gap))
         return true
     }
 
-    /// Snaps instantly or smoothly centers a column.
+    /// Animates a column into view, centered or revealed per `centerMode`.
     public func snapToColumn(at index: Int, in strip: Strip, viewportWidth: Double, gap: Double) {
         lock.lock()
         defer { lock.unlock() }
-
-        if let target = strip.centerOffset(forColumnAt: index, viewportWidth: viewportWidth, gap: gap) {
-            targetOffset = target
-            isSettled = false
-        }
+        head(to: focusTarget(forColumnAt: index, in: strip, viewportWidth: viewportWidth, gap: gap))
     }
 
-    /// Expands focused column and smoothly centers it.
+    /// Animates a column to the viewport center, whatever `centerMode` says.
+    public func centerColumn(at index: Int, in strip: Strip, viewportWidth: Double, gap: Double) {
+        lock.lock()
+        defer { lock.unlock() }
+        head(to: strip.centerOffset(forColumnAt: index, viewportWidth: viewportWidth, gap: gap))
+    }
+
+    /// Expands the focused column and keeps it in view.
     public func expandFocusedColumn(in strip: inout Strip, by delta: Double = 0.1, viewportWidth: Double, gap: Double) {
         lock.lock()
         defer { lock.unlock() }
 
         strip.expandFocusedColumn(by: delta, viewportWidth: viewportWidth)
-        if let target = strip.centerOffset(forColumnAt: strip.focusedColumnIndex, viewportWidth: viewportWidth, gap: gap) {
-            targetOffset = target
-            isSettled = false
-        }
+        head(to: focusTarget(forColumnAt: strip.focusedColumnIndex, in: strip, viewportWidth: viewportWidth, gap: gap))
     }
 
-    /// Shrinks focused column and smoothly centers it.
+    /// Shrinks the focused column and keeps it in view.
     public func shrinkFocusedColumn(in strip: inout Strip, by delta: Double = 0.1, viewportWidth: Double, gap: Double) {
         lock.lock()
         defer { lock.unlock() }
 
         strip.shrinkFocusedColumn(by: delta, viewportWidth: viewportWidth)
-        if let target = strip.centerOffset(forColumnAt: strip.focusedColumnIndex, viewportWidth: viewportWidth, gap: gap) {
-            targetOffset = target
-            isSettled = false
-        }
+        head(to: focusTarget(forColumnAt: strip.focusedColumnIndex, in: strip, viewportWidth: viewportWidth, gap: gap))
     }
 
     // MARK: - Simulation Tick

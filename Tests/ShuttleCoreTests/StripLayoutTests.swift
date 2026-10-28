@@ -273,3 +273,49 @@ import WeftCore
         #expect(f3?.height == 390.0)
     }
 }
+
+@Suite struct StripRegressionTests {
+    @Test func removingColumnLeftOfFocusKeepsFocusedColumn() {
+        var strip = Strip(columns: [
+            Column(windowIds: [1]), Column(windowIds: [2]), Column(windowIds: [3]),
+        ], focusedColumnIndex: 2, focusedWindowId: 3)
+
+        strip.removeWindow(1)
+
+        #expect(strip.columns.count == 2)
+        #expect(strip.focusedColumnIndex == 1)
+        #expect(strip.focusedWindowId == 3)
+    }
+
+    @Test func insertUsesRequestedWidth() {
+        var strip = Strip()
+        strip.insertWindow(7, width: .proportion(0.666))
+        #expect(strip.columns[0].width == .proportion(0.666))
+    }
+
+    @Test func consumeLeftKeepsFocusInsideFocusedColumn() {
+        var strip = Strip(columns: [
+            Column(windowIds: [1]), Column(windowIds: [2]),
+        ], focusedColumnIndex: 1, focusedWindowId: 2)
+
+        let consumed = strip.consumeAdjacentColumnIntoStack(toRight: false)
+        #expect(consumed)
+        #expect(strip.focusedColumnIndex == 0)
+        #expect(strip.columns[0].windowIds == [2, 1])
+        #expect(strip.focusedWindowId == 2)
+    }
+
+    @Test func revealScrollsOnlyAsFarAsNeeded() {
+        // Columns of 500 at 0, 516, 1032 in a 1000-wide viewport.
+        let strip = Strip(columns: [Column(windowIds: [1]), Column(windowIds: [2]), Column(windowIds: [3])])
+
+        // Column 1 (516..1016) at offset 0 overflows by 16: scroll 16.
+        #expect(strip.revealOffset(forColumnAt: 1, currentOffset: 0, viewportWidth: 1000, gap: 16) == 16)
+        // Already fully visible: stay.
+        #expect(strip.revealOffset(forColumnAt: 0, currentOffset: 0, viewportWidth: 1000, gap: 16) == 0)
+        // Left of the viewport: align its left edge.
+        #expect(strip.revealOffset(forColumnAt: 0, currentOffset: 300, viewportWidth: 1000, gap: 16) == 0)
+        // Column 2 (1032..1532) from 0: right edge to viewport's.
+        #expect(strip.revealOffset(forColumnAt: 2, currentOffset: 0, viewportWidth: 1000, gap: 16) == 532)
+    }
+}

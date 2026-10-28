@@ -1,5 +1,6 @@
 import Testing
 import ShuttleCore
+import WeftCore
 @testable import ShuttleScroller
 
 @Suite struct ScrollerTests {
@@ -139,5 +140,72 @@ import ShuttleCore
         scroller.shrinkFocusedColumn(in: &strip, by: 0.1, viewportWidth: viewportWidth, gap: gap)
         let shrunkW = strip.columns[0].width.resolve(viewportWidth: viewportWidth)
         #expect(shrunkW == 600.0) // 700 - 100
+    }
+}
+
+@Suite struct ScrollerRegressionTests {
+    @Test func snapToNearestMovesFocusedWindowWithColumn() {
+        var strip = Strip(columns: [Column(windowIds: [1]), Column(windowIds: [2])])
+        let scroller = Scroller()
+        scroller.setOffset(-250)
+        scroller.pan(delta: 400, in: strip, viewportWidth: 1000, gap: 16)
+
+        scroller.snapToNearest(in: &strip, viewportWidth: 1000, gap: 16)
+
+        #expect(strip.focusedColumnIndex == 1)
+        #expect(strip.focusedWindowId == 2)
+    }
+
+    @Test func flingOnEmptyStripReturns() {
+        // Used to re-take the scroller's non-recursive lock and deadlock.
+        var strip = Strip()
+        let scroller = Scroller()
+        scroller.fling(initialVelocity: 2000, in: &strip, viewportWidth: 1000, gap: 16)
+        #expect(scroller.isSettled)
+    }
+
+    @Test func neverModeRevealsInsteadOfCentering() {
+        var strip = Strip(columns: [Column(windowIds: [1]), Column(windowIds: [2]), Column(windowIds: [3])])
+        let scroller = Scroller(centerMode: .never)
+        scroller.setOffset(0)
+
+        _ = scroller.focusRight(in: &strip, viewportWidth: 1000, gap: 16)
+        #expect(scroller.targetOffset == 16)
+        _ = scroller.focusRight(in: &strip, viewportWidth: 1000, gap: 16)
+        #expect(scroller.targetOffset == 532)
+        // Column 1 (516..1016) starts 16 left of offset 532: align its left edge.
+        _ = scroller.focusLeft(in: &strip, viewportWidth: 1000, gap: 16)
+        #expect(scroller.targetOffset == 516)
+    }
+
+    @Test func snappingToWhereTheRibbonIsDoesNotWakeTheAnimator() {
+        let strip = Strip(columns: [Column(windowIds: [1])])
+        let scroller = Scroller()
+        scroller.setOffset(-250)
+        scroller.snapToColumn(at: 0, in: strip, viewportWidth: 1000, gap: 16)
+        #expect(scroller.isSettled)
+    }
+}
+
+@Suite struct SingleColumnTests {
+    @Test func loneColumnIsCenteredEvenInNeverMode() {
+        let strip = Strip(columns: [Column(windowIds: [1])])
+        let scroller = Scroller(centerMode: .never)
+        scroller.setOffset(300)
+        scroller.snapToColumn(at: 0, in: strip, viewportWidth: 1000, gap: 16)
+        // 500 wide in 1000: centered means offset -250.
+        #expect(scroller.targetOffset == -250)
+    }
+
+    @Test func loneColumnFillsWhenAskedAndGivesWidthBack() {
+        var strip = Strip(columns: [Column(windowIds: [1], width: .proportion(0.5))])
+        strip.fillsWhenAlone = true
+        let area = Frame(x: 16, y: 16, width: 968, height: 668)
+        #expect(strip.calculateWindowFrames(viewport: area, ribbonOffset: 0, gap: 16)[1]?.width == 968)
+
+        strip.insertWindow(2, width: .proportion(0.5))
+        let frames = strip.calculateWindowFrames(viewport: area, ribbonOffset: 0, gap: 16)
+        #expect(frames[1]?.width == 484)
+        #expect(frames[2]?.width == 484)
     }
 }

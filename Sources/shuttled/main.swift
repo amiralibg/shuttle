@@ -2,830 +2,324 @@ import AppKit
 import ApplicationServices
 import Foundation
 import ShuttleCore
-import ShuttleScroller
 import WeftCore
 import WeftPlatform
 import WeftInput
 import WeftIPC
 
-// Initialize AppKit connection
-_ = NSApplication.shared
+// MARK: - App
 
-// MARK: - Daemon Controller
+/// Startup, wiring and shutdown. Runs a real NSApplication event loop: a
+/// process that creates NSApplication but never reads its events is one the
+/// WindowServer waits on (weft measured up to half a second a call), and the
+/// Settings window needs it for keyboard input anyway.
+@MainActor
+final class ShuttleApp: NSObject, NSApplicationDelegate {
+    private let menuBar = MenuBarController()
+    private var controller: DaemonController?
+    private var settingsModel: SettingsModel?
+    private var settingsWindow: SettingsWindowController?
+    private var inputManager: InputManager?
+    private var observers: ObserverSet?
+    private var configWatcher: ConfigFileWatcher?
+    private var ipcServer: IPCServer?
+    private var permissionTimer: Timer?
+    private var pruneTimer: Timer?
+    private var signalSources: [DispatchSourceSignal] = []
+    private var configWarnings: [String] = []
 
-final class DaemonController: @unchecked Sendable {
-    private let lock = NSLock()
-    private var strips: [SpaceID: Strip] = [:]
-    private var activeSpaceID: SpaceID
-    private let scroller: Scroller
-    private let coordinator: WindowCoordinator
-    private var viewport: Frame
-    var onShutdown: (@Sendable () -> Void)?
+    private static let user = ProcessInfo.processInfo.environment["USER"] ?? "user"
+    static let socketPath = "/tmp/shuttle-\(user).sock"
 
-    init(initialStrip: Strip, initialSpaceID: SpaceID, scroller: Scroller, coordinator: WindowCoordinator, viewport: Frame) {
-        self.strips[initialSpaceID] = initialStrip
-        self.activeSpaceID = initialSpaceID
-        self.scroller = scroller
-        self.coordinator = coordinator
-        self.viewport = viewport
-    }
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        print("==================================================================")
+        print("  SHUTTLE DAEMON (shuttled v\(ShuttleVersion.full))")
+        print("  Infinite Horizontal Ribbon Scrolling Window Manager for macOS")
+        print("==================================================================")
 
-    private var currentStrip: Strip {
-        get { strips[activeSpaceID] ?? Strip() }
-        set { strips[activeSpaceID] = newValue }
-    }
+        installSignalHandlers()
+        menuBar.quit = { [weak self] in self?.shutdown() }
 
-    func tick(dt: Double) {
-        lock.lock()
-        defer { lock.unlock() }
-        if !scroller.isSettled {
-            scroller.tick(dt: dt)
-            let strip = currentStrip
-            _ = coordinator.update(strip: strip, viewport: viewport)
-        }
-    }
-
-    // MARK: - Interactive Mouse Gesture Tracking
-
-    private var isDraggingRibbon = false
-    private var lastDragLoc = CGPoint.zero
-    private var lastDragTime = 0.0
-    private var dragVelocity = 0.0
-
-    func handleMouseGesture(_ gesture: MouseGesture) {
-        lock.lock()
-        defer { lock.unlock() }
-
-        let now = CACurrentMediaTime()
-        switch gesture {
-        case .down(let button, let loc):
-            guard button == .left else { return }
-            isDraggingRibbon = true
-            lastDragLoc = loc
-            lastDragTime = now
-            dragVelocity = 0.0
-
-        case .drag(let button, let loc):
-            guard button == .left && isDraggingRibbon else { return }
-            let dt = max(0.001, now - lastDragTime)
-            let dx = Double(loc.x - lastDragLoc.x)
-            let instantVel = dx / dt
-            dragVelocity = dragVelocity * 0.6 + instantVel * 0.4
-            lastDragLoc = loc
-            lastDragTime = now
-
-            // Dragging right moves ribbon left (revealing left columns); invert dx for natural 1:1 paper feel
-            scroller.pan(delta: -dx, in: currentStrip, viewportWidth: viewport.width, gap: coordinator.gap)
-            _ = coordinator.update(strip: currentStrip, viewport: viewport)
-
-        case .up(let button, _):
-            guard button == .left && isDraggingRibbon else { return }
-            isDraggingRibbon = false
-            var strip = currentStrip
-            if abs(dragVelocity) > 350.0 {
-                // Natural flick with kinetic friction
-                scroller.fling(initialVelocity: -dragVelocity, in: &strip, viewportWidth: viewport.width, gap: coordinator.gap)
-            } else {
-                scroller.snapToNearest(in: &strip, viewportWidth: viewport.width, gap: coordinator.gap)
+        // Settings alone, no window management: for working on the UI.
+        if CommandLine.arguments.contains("--settings-preview") {
+            let (config, warnings) = ShuttleConfig.loadReport()
+            let model = SettingsModel(config: config)
+            model.loaded(config, warnings: warnings)
+            settingsModel = model
+            settingsWindow = SettingsWindowController(model: model)
+            let args = CommandLine.arguments
+            let pane = args.firstIndex(of: "--pane").flatMap { i in
+                args.indices.contains(i + 1) ? SettingsPane(rawValue: args[i + 1].capitalized) : nil
             }
-            currentStrip = strip
-            _ = coordinator.update(strip: currentStrip, viewport: viewport, force: true)
+            settingsWindow?.show(pane: pane ?? .layout)
+            return
         }
-    }
 
-    // MARK: - Space Management
-
-    func allSpaceIDs() -> [SpaceID] {
-        let displays = WorldReader.displaysOnly()
-        return displays.flatMap(\.spaces)
-    }
-
-    func resolveSpaceID(index: Int) -> SpaceID? {
-        let spaces = allSpaceIDs()
-        guard index >= 1 && index <= spaces.count else { return nil }
-        return spaces[index - 1]
-    }
-
-    func switchSpace(toIndex index: Int) -> String {
-        guard let targetSid = resolveSpaceID(index: index) else {
-            return "ERR: Space \(index) does not exist"
-        }
-        if targetSid == activeSpaceID {
-            return "OK: Already on space \(index)"
-        }
-        let switched = DockSwipe.focusSpace(targetSid)
-        if switched {
-            handleSpaceActivated(targetSid)
-            return "OK: Switched to space \(index)"
+        let options = [("AXTrustedCheckOptionPrompt" as CFString): true] as CFDictionary
+        if AXIsProcessTrustedWithOptions(options) {
+            start()
         } else {
-            return "ERR: Failed to switch to space \(index)"
-        }
-    }
-
-    func moveFocusedWindow(toSpaceIndex index: Int) -> String {
-        lock.lock()
-        defer { lock.unlock() }
-
-        guard let targetSid = resolveSpaceID(index: index) else {
-            return "ERR: Space \(index) does not exist"
-        }
-        guard let wid = currentStrip.focusedWindowId else {
-            return "ERR: No window focused"
-        }
-        if targetSid == activeSpaceID {
-            return "OK: Window is already on space \(index)"
-        }
-
-        let moved = NativeBridge.move([wid], to: targetSid)
-        guard moved.verdict.complete else {
-            return "ERR: NativeBridge failed to move window \(wid) to space \(index)"
-        }
-
-        // Remove from current space strip
-        var cur = currentStrip
-        cur.removeWindow(wid)
-        coordinator.unregister(windowID: wid)
-        scroller.snapToNearest(in: &cur, viewportWidth: viewport.width, gap: coordinator.gap)
-        currentStrip = cur
-
-        // Add to target space strip
-        var targetStrip = strips[targetSid] ?? Strip()
-        targetStrip.insertWindow(wid, asNewColumn: true)
-        strips[targetSid] = targetStrip
-
-        _ = coordinator.update(strip: currentStrip, viewport: viewport, force: true)
-        return "OK: Moved window \(wid) to space \(index)"
-    }
-
-    func handleSpaceActivated(_ sid: SpaceID) {
-        lock.lock()
-        defer { lock.unlock() }
-
-        guard sid != activeSpaceID else { return }
-        print("🌌 Switched active space to sid=\(sid)")
-        activeSpaceID = sid
-        if strips[sid] == nil {
-            strips[sid] = Strip()
-        }
-        let strip = currentStrip
-        scroller.snapToColumn(at: strip.focusedColumnIndex, in: strip, viewportWidth: viewport.width, gap: coordinator.gap)
-        _ = coordinator.update(strip: strip, viewport: viewport, force: true)
-    }
-
-    // MARK: - Dynamic Lifecycle Handlers
-
-    func handleWindowCreated(pid: Int32, wid: WindowID?) {
-        lock.lock()
-        defer { lock.unlock() }
-
-        var targetWid = wid
-        var targetElement: AXUIElement?
-
-        let appElement = AXUIElementCreateApplication(pid)
-        if targetWid == nil {
-            var focusedRef: CFTypeRef?
-            if AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &focusedRef) == .success,
-               let win = focusedRef as! AXUIElement? {
-                targetWid = PublicPaths.windowID(of: win)
-                targetElement = win
-            }
-        } else {
-            var winRef: CFTypeRef?
-            if AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &winRef) == .success,
-               let axWins = winRef as? [AXUIElement] {
-                for win in axWins {
-                    if PublicPaths.windowID(of: win) == targetWid {
-                        targetElement = win
-                        break
-                    }
+            // Wait for the grant instead of exiting: the user would otherwise
+            // have to find and relaunch Shuttle after ticking the box.
+            print("⏳ Waiting for Accessibility permission (System Settings → Privacy & Security → Accessibility)...")
+            menuBar.showWaitingForPermission()
+            permissionTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard AXIsProcessTrusted() else { return }
+                    self?.permissionTimer?.invalidate()
+                    self?.permissionTimer = nil
+                    self?.start()
                 }
             }
         }
-
-        guard let validWid = targetWid, let element = targetElement else { return }
-
-        // Check if window is already tracked in active strip
-        var strip = currentStrip
-        if strip.column(forWindowID: validWid) != nil { return }
-
-        // Filter valid normal windows
-        var sizeRef: CFTypeRef?
-        _ = AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeRef)
-        var size = CGSize.zero
-        if let s = sizeRef as! AXValue? { AXValueGetValue(s, .cgSize, &size) }
-        guard size.width >= 200 && size.height >= 200 && size.width < 3500 else { return }
-
-        print("🪟 New window created: wid=\(validWid) pid=\(pid)")
-        strip.insertWindow(validWid, asNewColumn: true)
-        currentStrip = strip
-        coordinator.register(windowID: validWid, element: element)
-        scroller.snapToColumn(at: strip.focusedColumnIndex, in: strip, viewportWidth: viewport.width, gap: coordinator.gap)
-        _ = coordinator.update(strip: strip, viewport: viewport, force: true)
     }
 
-    func handleWindowDestroyed(wid: WindowID) {
-        lock.lock()
-        defer { lock.unlock() }
+    private func start() {
+        let (config, warnings) = ShuttleConfig.loadReport()
+        configWarnings = warnings
+        warnings.forEach { print("⚠️  config: \($0)") }
+        print("⚙️  Loaded configuration (gap: \(config.gap)pt, spring omega: \(config.springOmega), mouse mod: \(config.mouseModifier))")
 
-        var strip = currentStrip
-        guard strip.column(forWindowID: wid) != nil else { return }
-        print("🗑️  Window destroyed: wid=\(wid)")
-        _ = strip.removeWindow(wid)
-        coordinator.unregister(windowID: wid)
-        _ = scroller.snapToNearest(in: &strip, viewportWidth: viewport.width, gap: coordinator.gap)
-        currentStrip = strip
-        _ = coordinator.update(strip: strip, viewport: viewport, force: true)
-    }
-
-    func handleWindowFocused(wid: WindowID?) {
-        lock.lock()
-        defer { lock.unlock() }
-
-        var strip = currentStrip
-        guard let wid = wid, let (colIdx, _) = strip.column(forWindowID: wid) else { return }
-        if strip.focusedColumnIndex != colIdx || strip.focusedWindowId != wid {
-            print("🎯 Focus changed to window wid=\(wid) (column \(colIdx))")
-            strip.focusedWindowId = wid
-            _ = scroller.focusColumn(at: colIdx, in: &strip, viewportWidth: viewport.width, gap: coordinator.gap)
-            currentStrip = strip
-            _ = coordinator.update(strip: strip, viewport: viewport, force: true)
-        }
-    }
-
-    func handleAppActivated(pid: Int32) {
-        lock.lock()
-        defer { lock.unlock() }
-
-        var strip = currentStrip
-        let appElement = AXUIElementCreateApplication(pid)
-        var focusedRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &focusedRef) == .success,
-              let win = focusedRef as! AXUIElement?,
-              let wid = PublicPaths.windowID(of: win),
-              let (colIdx, _) = strip.column(forWindowID: wid) else { return }
-
-        if strip.focusedColumnIndex != colIdx || strip.focusedWindowId != wid {
-            print("📱 App activated (pid=\(pid)), centering column \(colIdx)")
-            strip.focusedWindowId = wid
-            _ = scroller.focusColumn(at: colIdx, in: &strip, viewportWidth: viewport.width, gap: coordinator.gap)
-            currentStrip = strip
-            _ = coordinator.update(strip: strip, viewport: viewport, force: true)
-        }
-    }
-
-    func handleDisplayChanged() {
-        lock.lock()
-        defer { lock.unlock() }
-
-        let displays = SpaceControl.displayLayout()
-        if let newVp = displays.first?.visible {
-            viewport = newVp
-            print("🖥️  Viewport updated: \(String(format: "%.0fx%.0f", viewport.width, viewport.height))")
-            let strip = currentStrip
-            scroller.snapToColumn(at: strip.focusedColumnIndex, in: strip, viewportWidth: viewport.width, gap: coordinator.gap)
-            _ = coordinator.update(strip: strip, viewport: viewport, force: true)
-        }
-    }
-
-    // MARK: - Command Dispatcher
-
-    func handleCommand(_ command: String) -> String {
-        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
-        let parts = trimmed.split(separator: " ").map(String.init)
-        guard let rawVerb = parts.first else { return "ERR: Empty command" }
-
-        // Canonicalize short command aliases
-        let verb: String
-        let sub: String
-
-        switch rawVerb {
-        case "focus-left", "left", "west":
-            verb = "column"; sub = "focus-left"
-        case "focus-right", "right", "east":
-            verb = "column"; sub = "focus-right"
-        case "move-left":
-            verb = "column"; sub = "move-left"
-        case "move-right":
-            verb = "column"; sub = "move-right"
-        case "preset", "cycle":
-            verb = "column"; sub = "preset"
-        case "maximize", "fullscreen":
-            verb = "column"; sub = "maximize"
-        case "expand":
-            verb = "column"; sub = "expand"
-        case "shrink":
-            verb = "column"; sub = "shrink"
-        case "center":
-            verb = "column"; sub = "center"
-        case "focus-up", "up", "north":
-            verb = "window"; sub = "focus-up"
-        case "focus-down", "down", "south":
-            verb = "window"; sub = "focus-down"
-        case "move-up":
-            verb = "window"; sub = "move-up"
-        case "move-down":
-            verb = "window"; sub = "move-down"
-        case "split":
-            verb = "window"; sub = "split"
-        case "consume-left":
-            verb = "column"; sub = "consume-left"
-        case "consume-right":
-            verb = "column"; sub = "consume-right"
-        default:
-            verb = rawVerb
-            sub = parts.dropFirst().joined(separator: " ")
-        }
-
-        switch verb {
-        case "stop", "quit", "exit":
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-                self?.onShutdown?()
-            }
-            return "OK: Shutting down shuttled daemon..."
-
-        case "space":
-            guard parts.count >= 3 else { return "ERR: Usage: space focus <1..9> or space move-window <1..9>" }
-            let action = parts[1]
-            guard let n = Int(parts[2]) else { return "ERR: Invalid space number '\(parts[2])'" }
-            if action == "focus" {
-                return switchSpace(toIndex: n)
-            } else if action == "move-window" || action == "move" {
-                return moveFocusedWindow(toSpaceIndex: n)
-            }
-            return "ERR: Unknown space action '\(action)'"
-
-        case "window":
-            lock.lock()
-            defer { lock.unlock() }
-            var strip = currentStrip
-            if sub == "focus-up" || sub == "up" || sub == "north" {
-                let ok = strip.focusUp()
-                if ok {
-                    currentStrip = strip
-                    if let wid = strip.focusedWindowId { coordinator.raiseAndFocus(windowID: wid) }
-                }
-                return ok ? "OK: Focused window \(strip.focusedWindowId ?? 0)" : "ERR: Already at top of column"
-            } else if sub == "focus-down" || sub == "down" || sub == "south" {
-                let ok = strip.focusDown()
-                if ok {
-                    currentStrip = strip
-                    if let wid = strip.focusedWindowId { coordinator.raiseAndFocus(windowID: wid) }
-                }
-                return ok ? "OK: Focused window \(strip.focusedWindowId ?? 0)" : "ERR: Already at bottom of column"
-            } else if sub == "move-up" {
-                let ok = strip.moveFocusedWindowUp()
-                if ok {
-                    currentStrip = strip
-                    _ = coordinator.update(strip: strip, viewport: viewport, force: true)
-                }
-                return ok ? "OK: Moved window up" : "ERR: Cannot move top window up"
-            } else if sub == "move-down" {
-                let ok = strip.moveFocusedWindowDown()
-                if ok {
-                    currentStrip = strip
-                    _ = coordinator.update(strip: strip, viewport: viewport, force: true)
-                }
-                return ok ? "OK: Moved window down" : "ERR: Cannot move bottom window down"
-            } else if sub == "split" {
-                let ok = strip.splitFocusedWindowIntoNewColumn()
-                if ok {
-                    scroller.snapToColumn(at: strip.focusedColumnIndex, in: strip, viewportWidth: viewport.width, gap: coordinator.gap)
-                    currentStrip = strip
-                    _ = coordinator.update(strip: strip, viewport: viewport, force: true)
-                }
-                return ok ? "OK: Split window into new column" : "ERR: Column only has one window"
-            }
-            return "ERR: Unknown window subcommand '\(sub)'"
-
-        case "column", "focus":
-            lock.lock()
-            defer { lock.unlock() }
-            var strip = currentStrip
-            if sub == "focus-left" || sub == "left" || sub == "west" {
-                let ok = scroller.focusLeft(in: &strip, viewportWidth: viewport.width, gap: coordinator.gap)
-                currentStrip = strip
-                if ok {
-                    _ = coordinator.update(strip: strip, viewport: viewport, force: true)
-                    if let wid = strip.focusedWindowId { coordinator.raiseAndFocus(windowID: wid) }
-                }
-                return ok ? "OK: Focused column \(strip.focusedColumnIndex)" : "ERR: Already at leftmost column"
-            } else if sub == "focus-right" || sub == "right" || sub == "east" {
-                let ok = scroller.focusRight(in: &strip, viewportWidth: viewport.width, gap: coordinator.gap)
-                currentStrip = strip
-                if ok {
-                    _ = coordinator.update(strip: strip, viewport: viewport, force: true)
-                    if let wid = strip.focusedWindowId { coordinator.raiseAndFocus(windowID: wid) }
-                }
-                return ok ? "OK: Focused column \(strip.focusedColumnIndex)" : "ERR: Already at rightmost column"
-            } else if sub == "move-left" || sub == "move west" {
-                let ok = strip.moveFocusedColumnLeft()
-                currentStrip = strip
-                if ok {
-                    scroller.snapToColumn(at: strip.focusedColumnIndex, in: strip, viewportWidth: viewport.width, gap: coordinator.gap)
-                    _ = coordinator.update(strip: strip, viewport: viewport, force: true)
-                }
-                return ok ? "OK: Moved column left to \(strip.focusedColumnIndex)" : "ERR: Cannot move leftmost column"
-            } else if sub == "move-right" || sub == "move east" {
-                let ok = strip.moveFocusedColumnRight()
-                currentStrip = strip
-                if ok {
-                    scroller.snapToColumn(at: strip.focusedColumnIndex, in: strip, viewportWidth: viewport.width, gap: coordinator.gap)
-                    _ = coordinator.update(strip: strip, viewport: viewport, force: true)
-                }
-                return ok ? "OK: Moved column right to \(strip.focusedColumnIndex)" : "ERR: Cannot move rightmost column"
-            } else if sub == "preset" || sub == "cycle" {
-                strip.cycleColumnWidthPreset(viewportWidth: viewport.width)
-                scroller.snapToColumn(at: strip.focusedColumnIndex, in: strip, viewportWidth: viewport.width, gap: coordinator.gap)
-                currentStrip = strip
-                _ = coordinator.update(strip: strip, viewport: viewport, force: true)
-                return "OK: Cycled column preset width"
-            } else if sub == "maximize" || sub == "fullscreen" {
-                strip.toggleMaximizeColumn(viewportWidth: viewport.width)
-                scroller.snapToColumn(at: strip.focusedColumnIndex, in: strip, viewportWidth: viewport.width, gap: coordinator.gap)
-                currentStrip = strip
-                _ = coordinator.update(strip: strip, viewport: viewport, force: true)
-                return "OK: Toggled column maximize"
-            } else if sub == "consume-left" {
-                let ok = strip.consumeAdjacentColumnIntoStack(toRight: false)
-                if ok {
-                    scroller.snapToColumn(at: strip.focusedColumnIndex, in: strip, viewportWidth: viewport.width, gap: coordinator.gap)
-                    currentStrip = strip
-                    _ = coordinator.update(strip: strip, viewport: viewport, force: true)
-                }
-                return ok ? "OK: Consumed left column into stack" : "ERR: No left column to consume"
-            } else if sub == "consume-right" {
-                let ok = strip.consumeAdjacentColumnIntoStack(toRight: true)
-                if ok {
-                    scroller.snapToColumn(at: strip.focusedColumnIndex, in: strip, viewportWidth: viewport.width, gap: coordinator.gap)
-                    currentStrip = strip
-                    _ = coordinator.update(strip: strip, viewport: viewport, force: true)
-                }
-                return ok ? "OK: Consumed right column into stack" : "ERR: No right column to consume"
-            } else if sub == "expand" {
-                scroller.expandFocusedColumn(in: &strip, by: 0.1, viewportWidth: viewport.width, gap: coordinator.gap)
-                currentStrip = strip
-                _ = coordinator.update(strip: strip, viewport: viewport, force: true)
-                return "OK: Expanded column \(strip.focusedColumnIndex)"
-            } else if sub == "shrink" {
-                scroller.shrinkFocusedColumn(in: &strip, by: 0.1, viewportWidth: viewport.width, gap: coordinator.gap)
-                currentStrip = strip
-                _ = coordinator.update(strip: strip, viewport: viewport, force: true)
-                return "OK: Shrunk column \(strip.focusedColumnIndex)"
-            } else if sub == "center" {
-                scroller.snapToColumn(at: strip.focusedColumnIndex, in: strip, viewportWidth: viewport.width, gap: coordinator.gap)
-                _ = coordinator.update(strip: strip, viewport: viewport, force: true)
-                return "OK: Centered column \(strip.focusedColumnIndex)"
-            }
-            return "ERR: Unknown column subcommand '\(sub)'"
-
-        case "pan":
-            lock.lock()
-            defer { lock.unlock() }
-            guard parts.count >= 2, let delta = Double(parts[1]) else { return "ERR: Usage: pan <delta>" }
-            scroller.pan(delta: delta, in: currentStrip, viewportWidth: viewport.width, gap: coordinator.gap)
-            _ = coordinator.update(strip: currentStrip, viewport: viewport)
-            return "OK: Panned \(delta)"
-
-        case "fling":
-            lock.lock()
-            defer { lock.unlock() }
-            var strip = currentStrip
-            guard parts.count >= 2, let vel = Double(parts[1]) else { return "ERR: Usage: fling <velocity>" }
-            scroller.fling(initialVelocity: vel, in: &strip, viewportWidth: viewport.width, gap: coordinator.gap)
-            currentStrip = strip
-            return "OK: Flung with velocity \(vel)"
-
-        case "snap":
-            lock.lock()
-            defer { lock.unlock() }
-            var strip = currentStrip
-            let ok = scroller.snapToNearest(in: &strip, viewportWidth: viewport.width, gap: coordinator.gap)
-            currentStrip = strip
-            _ = coordinator.update(strip: strip, viewport: viewport, force: true)
-            return ok ? "OK: Snapped to column \(strip.focusedColumnIndex)" : "ERR: No columns to snap to"
-
-        case "scroll":
-            lock.lock()
-            defer { lock.unlock() }
-            guard parts.count >= 2, let delta = Double(parts[1]) else { return "ERR: Usage: scroll <delta>" }
-            scroller.scroll(by: delta)
-            return "OK: Scrolled by \(delta)"
-
-        case "status":
-            lock.lock()
-            defer { lock.unlock() }
-            let strip = currentStrip
-            let totalW = strip.totalWidth(viewportWidth: viewport.width, gap: coordinator.gap)
-            return """
-            {
-              "activeSpaceID": \(activeSpaceID),
-              "columns": \(strip.columns.count),
-              "focusedColumnIndex": \(strip.focusedColumnIndex),
-              "focusedWindowId": \(strip.focusedWindowId ?? 0),
-              "currentOffset": \(scroller.currentOffset),
-              "targetOffset": \(scroller.targetOffset),
-              "isSettled": \(scroller.isSettled),
-              "totalRibbonWidth": \(totalW),
-              "viewport": {"width": \(viewport.width), "height": \(viewport.height)}
-            }
-            """
-
-        default:
-            return "ERR: Unknown command '\(trimmed)'"
-        }
-    }
-}
-
-// MARK: - Menu Bar Controller
-
-final class MenuBarController: NSObject, @unchecked Sendable {
-    private var statusItem: NSStatusItem?
-    private let controller: DaemonController
-
-    init(controller: DaemonController) {
+        let controller = DaemonController(config: config)
         self.controller = controller
-        super.init()
-        setupMenu()
+        controller.onShutdown = { [weak self] in self?.shutdown() }
+        controller.onReloadRequested = { [weak self] in self?.reloadConfig() }
+        controller.onStateChange = { [weak self] in self?.stateChanged() }
+        controller.onWindowManaged = { [weak self] wid, pid in
+            self?.observers?.watch(pids: [pid], windows: [(wid, pid)])
+        }
+
+        let model = SettingsModel(config: config)
+        model.loaded(config, warnings: warnings)
+        model.runCommand = { [weak self] cmd in _ = self?.controller?.handleCommand(cmd) }
+        model.focusDesktop = { [weak self] uuid, index in _ = self?.controller?.focusSpace(onDisplay: uuid, index: index) }
+        model.setHotkeysPaused = { [weak self] paused in self?.setHotkeysPaused(paused) }
+        settingsModel = model
+        settingsWindow = SettingsWindowController(model: model)
+
+        menuBar.status = { [weak controller] in controller?.status() }
+        menuBar.config = { [weak controller] in controller?.config ?? .default }
+        menuBar.configWarnings = { [weak self] in self?.configWarnings ?? [] }
+        menuBar.runCommand = { [weak self] cmd in _ = self?.controller?.handleCommand(cmd) }
+        menuBar.focusDesktop = { [weak self] uuid, index in _ = self?.controller?.focusSpace(onDisplay: uuid, index: index) }
+        menuBar.openSettings = { [weak self] in self?.settingsWindow?.show() }
+        menuBar.reloadConfig = { [weak self] in self?.reloadConfig() }
+
+        // Observers first: every window the sweep files is watched as it is filed.
+        startObservers(controller)
+        controller.discoverAll()
+        // Backstop for windows that close without telling anyone: one
+        // window-list read every few seconds.
+        pruneTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { _ = self?.controller?.pruneClosedWindows() }
+        }
+        print("Displays: \(controller.status().monitors.map(\.name).joined(separator: ", "))")
+
+        startInput(config)
+        startIPC()
+
+        configWatcher = ConfigFileWatcher(file: ShuttleConfig.defaultConfigFileURL()) { [weak self] in
+            MainActor.assumeIsolated { self?.reloadConfig() }
+        }
+        configWatcher?.start()
+
+        stateChanged()
+        print("\n🚀 shuttled daemon ready.")
     }
 
-    func setupMenu() {
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-            if let button = item.button {
-                button.title = " 🚀 Shuttle "
-                button.toolTip = "Shuttle - Infinite Horizontal Ribbon Window Manager"
+    // MARK: - Wiring
+
+    private func startObservers(_ controller: DaemonController) {
+        let observers = ObserverSet()
+        observers.onEvent = { [weak self] event in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self?.handle(event) }
             }
-
-            let menu = NSMenu()
-            let titleItem = NSMenuItem(title: "Shuttle v\(ShuttleVersion.full) (Active)", action: nil, keyEquivalent: "")
-            titleItem.isEnabled = false
-            menu.addItem(titleItem)
-            menu.addItem(NSMenuItem.separator())
-
-            let centerItem = NSMenuItem(title: "Center Focused Column", action: #selector(self.centerColumn), keyEquivalent: "0")
-            centerItem.target = self
-            menu.addItem(centerItem)
-
-            let presetItem = NSMenuItem(title: "Cycle Column Width Preset", action: #selector(self.cyclePreset), keyEquivalent: "r")
-            presetItem.target = self
-            menu.addItem(presetItem)
-
-            let configItem = NSMenuItem(title: "Open Configuration...", action: #selector(self.openConfig), keyEquivalent: ",")
-            configItem.target = self
-            menu.addItem(configItem)
-
-            menu.addItem(NSMenuItem.separator())
-
-            let quitItem = NSMenuItem(title: "Quit Shuttle", action: #selector(self.quitApp), keyEquivalent: "q")
-            quitItem.target = self
-            menu.addItem(quitItem)
-
-            item.menu = menu
-            self.statusItem = item
         }
+        observers.start()
+        let pids = WindowDiscovery.regularAppPIDs()
+        observers.watch(pids: pids, windows: [])
+        self.observers = observers
+        print("👁️  Window lifecycle observers attached to \(pids.count) apps.")
     }
 
-    @objc func centerColumn() {
-        _ = controller.handleCommand("column center")
-    }
-
-    @objc func cyclePreset() {
-        _ = controller.handleCommand("column preset")
-    }
-
-    @objc func openConfig() {
-        let url = ShuttleConfig.defaultConfigFileURL()
-        NSWorkspace.shared.open(url)
-    }
-
-    @objc func quitApp() {
-        controller.onShutdown?()
-    }
-}
-
-// MARK: - Startup
-
-print("==================================================================")
-print("  SHUTTLE DAEMON (shuttled v\(ShuttleVersion.full))")
-print("  Infinite Horizontal Ribbon Scrolling Window Manager for macOS")
-print("==================================================================")
-
-// Ensure accessibility check with prompt if not trusted
-let options = [("AXTrustedCheckOptionPrompt" as CFString): true] as CFDictionary
-let trustedCheck = AXIsProcessTrustedWithOptions(options)
-
-guard trustedCheck else {
-    print("❌ Accessibility permissions not granted.")
-    print("Opening System Settings -> Privacy & Security -> Accessibility...")
-    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
-        NSWorkspace.shared.open(url)
-    }
-    exit(1)
-}
-
-// 0. Load Configuration
-let config = ShuttleConfig.load()
-print("⚙️  Loaded configuration (gap: \(config.gap)pt, spring omega: \(config.springOmega), mouse mod: \(config.mouseModifier))")
-
-// 1. Resolve Display Viewport and Active Space
-let displays = SpaceControl.displayLayout()
-let viewport: Frame = displays.first?.visible ?? Frame(x: 0, y: 0, width: 1710, height: 1112)
-let currentSpaces = WorldReader.currentSpaces()
-let initialSpaceID: SpaceID = currentSpaces.values.first ?? 1
-print("Active Viewport: \(String(format: "%.0fx%.0f at (%.0f, %.0f)", viewport.width, viewport.height, viewport.x, viewport.y))")
-print("Active Space ID: \(initialSpaceID)")
-
-// 2. Discover Running Windows
-var initialStrip = Strip()
-let scroller = Scroller(strategy: .hybrid, omega: config.springOmega)
-let coordinator = WindowCoordinator(scroller: scroller, gap: config.gap)
-
-let runningApps = NSWorkspace.shared.runningApplications.filter {
-    $0.activationPolicy == .regular && $0.bundleIdentifier != Bundle.main.bundleIdentifier
-}
-
-print("Discovering active application windows...")
-var initialPids: [Int32] = []
-var initialWindows: [(WindowID, Int32)] = []
-
-for app in runningApps {
-    let pid = app.processIdentifier
-    initialPids.append(pid)
-    let appElement = AXUIElementCreateApplication(pid)
-    var winRef: CFTypeRef?
-    guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &winRef) == .success,
-          let axWins = winRef as? [AXUIElement] else { continue }
-
-    for win in axWins {
-        var sizeRef: CFTypeRef?
-        _ = AXUIElementCopyAttributeValue(win, kAXSizeAttribute as CFString, &sizeRef)
-        var size = CGSize.zero
-        if let s = sizeRef as! AXValue? { AXValueGetValue(s, .cgSize, &size) }
-        guard size.width >= 200 && size.height >= 200 && size.width < 3500 else { continue }
-
-        if let wid = PublicPaths.windowID(of: win) {
-            initialStrip.insertWindow(wid, asNewColumn: true)
-            coordinator.register(windowID: wid, element: win)
-            initialWindows.append((wid, pid))
-        }
-    }
-}
-print("Initialized strip with \(initialStrip.columns.count) columns (\(initialWindows.count) windows).")
-
-// Snap to initial column
-if !initialStrip.columns.isEmpty {
-    scroller.snapToColumn(at: initialStrip.focusedColumnIndex, in: initialStrip, viewportWidth: viewport.width, gap: coordinator.gap)
-    _ = coordinator.update(strip: initialStrip, viewport: viewport, force: true)
-}
-
-let controller = DaemonController(
-    initialStrip: initialStrip,
-    initialSpaceID: initialSpaceID,
-    scroller: scroller,
-    coordinator: coordinator,
-    viewport: viewport
-)
-
-// 2.5 Initialize Menu Bar Item
-let menuBar = MenuBarController(controller: controller)
-
-// 3. Dynamic Window & Space Lifecycle Observers
-let observers = ObserverSet()
-observers.onEvent = { [weak controller] event in
-    DispatchQueue.main.async {
+    private func handle(_ event: ObserverEvent) {
+        guard let controller else { return }
         switch event {
         case .windowCreated(let pid, let wid):
-            controller?.handleWindowCreated(pid: pid, wid: wid)
+            controller.handleWindowCreated(pid: pid, wid: wid)
         case .windowDestroyed(let wid):
-            controller?.handleWindowDestroyed(wid: wid)
+            observers?.forgetWindow(wid)
+            controller.handleWindowDestroyed(wid: wid)
         case .windowFocused(let wid):
-            controller?.handleWindowFocused(wid: wid)
+            controller.handleWindowFocused(wid: wid)
         case .appActivated(let pid):
-            controller?.handleAppActivated(pid: pid)
+            controller.handleAppActivated(pid: pid)
         case .appLaunched(let pid, _):
-            observers.watch(pids: [pid], windows: [])
+            guard pid != WindowDiscovery.shuttlePID else { return }
+            observers?.watch(pids: [pid], windows: [])
+            controller.handleAppLaunched(pid: pid)
         case .appTerminated(let pid, _):
-            observers.forgetApp(pid: pid)
+            observers?.forgetApp(pid: pid)
+            controller.handleAppTerminated(pid: pid)
+        case .windowMoved(let wid), .windowResized(let wid):
+            controller.handleWindowGeometryChanged(wid: wid)
         case .spaceChanged:
-            let curSpaces = WorldReader.currentSpaces()
-            if let curSid = curSpaces.values.first {
-                controller?.handleSpaceActivated(curSid)
-            }
+            controller.handleSpaceChanged()
         case .displayChanged:
-            controller?.handleDisplayChanged()
-        default:
-            break
+            controller.handleDisplayChanged()
+        case .missionControl(let open):
+            controller.handleMissionControl(open: open)
         }
     }
-}
-observers.start()
-observers.watch(pids: initialPids, windows: initialWindows)
-print("👁️  Dynamic window lifecycle observers attached.")
 
-// 4. Keyboard Navigation Setup (InputManager)
-var binds: [(String, String)] = []
-for (k, v) in config.keybindings {
-    binds.append((k, v))
-}
+    /// The default key table plus one per `[mode.<name>]`. A binding to
+    /// `mode <name>` switches tables inside the event tap.
+    private static func keymap(for config: ShuttleConfig) -> Keymap {
+        func table(_ binds: [String: String]) -> [Chord: KeyAction] {
+            var out: [Chord: KeyAction] = [:]
+            for (chordStr, cmdStr) in binds {
+                guard let chord = try? parseChord(chordStr) else {
+                    print("⚠️  Ignoring keybinding with unknown chord '\(chordStr)'")
+                    continue
+                }
+                out[chord] = cmdStr.hasPrefix("mode ") ? .mode(String(cmdStr.dropFirst(5))) : .send(cmdStr)
+            }
+            return out
+        }
+        var modes = ["default": table(config.keybindings)]
+        for (name, binds) in config.modes where name != "default" {
+            modes[name] = table(binds)
+        }
+        return Keymap(modes: modes)
+    }
 
-// Spaces bindings: Alt + 1..9 (switch) & Alt + Shift + 1..9 (move window)
-for i in 1...9 {
-    binds.append(("alt-\(i)", "space focus \(i)"))
-    binds.append(("alt-shift-\(i)", "space move-window \(i)"))
-}
+    private func startInput(_ config: ShuttleConfig) {
+        let input = InputManager(keymap: Self.keymap(for: config))
+        input.updateMouseModifier(config.mouseModifier)
+        // The tap calls back on its own thread; every command runs on main.
+        input.onCommand = { [weak self] cmd in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let res = self?.controller?.handleCommand(cmd) else { return }
+                    print("⌨️  \(cmd) -> \(res)")
+                }
+            }
+        }
+        input.onModeChange = { [weak self] mode in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    self?.menuBar.mode = mode
+                    self?.menuBar.refresh()
+                }
+            }
+        }
+        input.onMouseGesture = { [weak self] gesture in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self?.controller?.handleMouseGesture(gesture) }
+            }
+        }
+        if input.start() {
+            print("✅ Keyboard & mouse navigation active (\(config.keybindings.count) bindings, drag with \(config.mouseModifier)).")
+        } else {
+            print("⚠️  Warning: Failed to install event tap for keyboard navigation.")
+        }
+        inputManager = input
+    }
 
-var chordMap: [Chord: KeyAction] = [:]
-for (chordStr, cmdStr) in binds {
-    if let chord = try? parseChord(chordStr) {
-        chordMap[chord] = KeyAction.send(cmdStr)
+    private func setHotkeysPaused(_ paused: Bool) {
+        guard let input = inputManager, let controller else { return }
+        input.updateKeymap(paused ? Keymap(modes: ["default": [:]]) : Self.keymap(for: controller.config))
+    }
+
+    private func startIPC() {
+        unlink(Self.socketPath)
+        ignoreSIGPIPE()
+        let server = IPCServer(path: Self.socketPath) { [weak self] line, conn in
+            // The socket thread waits for main; commands never run concurrently.
+            let responseText = DispatchQueue.main.sync {
+                MainActor.assumeIsolated { self?.controller?.handleCommand(line) ?? "ERR: Shuttle is not running" }
+            }
+            let resp = IPCResponse(ok: !responseText.hasPrefix("ERR"), output: responseText)
+            if let data = try? JSONEncoder().encode(resp), let json = String(data: data, encoding: .utf8) {
+                conn.send(json)
+            } else {
+                conn.send(responseText)
+            }
+        }
+        ipcServer = server
+        DispatchQueue.global(qos: .userInteractive).async {
+            server.run()
+        }
+        print("🔌 IPC server listening on \(Self.socketPath)")
+    }
+
+    // MARK: - Config & state
+
+    private func reloadConfig() {
+        guard let controller else { return }
+        let (config, warnings) = ShuttleConfig.loadReport()
+        configWarnings = warnings
+        warnings.forEach { print("⚠️  config: \($0)") }
+        let keysChanged = config.keybindings != controller.config.keybindings
+        let modifierChanged = config.mouseModifier != controller.config.mouseModifier
+        controller.apply(config: config)
+        if keysChanged, settingsModel?.recordingCommand == nil {
+            inputManager?.updateKeymap(Self.keymap(for: config))
+        }
+        if modifierChanged { inputManager?.updateMouseModifier(config.mouseModifier) }
+        settingsModel?.loaded(config, warnings: warnings)
+        menuBar.flash(warnings.isEmpty ? "✓" : "⚠︎")
+        print("♻️  Configuration reloaded\(warnings.isEmpty ? "" : " with \(warnings.count) problem(s)").")
+    }
+
+    private func stateChanged() {
+        menuBar.refresh()
+        settingsModel?.update(status: controller?.status())
+    }
+
+    // MARK: - Shutdown
+
+    private func installSignalHandlers() {
+        for sig in [SIGINT, SIGTERM] {
+            signal(sig, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+            source.setEventHandler { [weak self] in
+                MainActor.assumeIsolated { self?.shutdown() }
+            }
+            source.resume()
+            signalSources.append(source)
+        }
+    }
+
+    func shutdown() {
+        print("\n🛑 Shutting down Shuttle daemon...")
+        // Every parked or off-screen window comes back where it can be reached.
+        controller?.releaseWindows()
+        configWatcher?.stop()
+        inputManager?.stop()
+        observers?.stop()
+        unlink(Self.socketPath)
+        exit(0)
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        controller?.releaseWindows()
+        unlink(Self.socketPath)
     }
 }
 
-let keymap = Keymap(modes: ["default": chordMap])
-let inputManager = InputManager(keymap: keymap)
-inputManager.updateMouseModifier(config.mouseModifier)
+// MARK: - Entry point
 
-inputManager.onCommand = { cmd in
-    let res = controller.handleCommand(cmd)
-    print("⌨️  Keyboard command: \(cmd) -> \(res)")
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)
+// Run from .build there is no bundle to take the icon from.
+if Bundle.main.object(forInfoDictionaryKey: "CFBundleIconFile") == nil,
+   let icon = NSImage(contentsOf: URL(fileURLWithPath: #filePath)
+       .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+       .appendingPathComponent("extra/AppIcon.png")) {
+    app.applicationIconImage = icon
 }
-
-inputManager.onMouseGesture = { gesture in
-    controller.handleMouseGesture(gesture)
-}
-
-if inputManager.start() {
-    print("✅ Keyboard & mouse ribbon navigation active:")
-    print("   • Alt + H/L or Left/Right:     Focus column left / right")
-    print("   • Alt + J/K or Down/Up:        Focus window down / up in stack")
-    print("   • Alt + Shift + H/L:           Move column left / right")
-    print("   • Alt + Shift + J/K:           Move window down / up in stack")
-    print("   • Alt + R:                     Cycle preset width (1/3 -> 1/2 -> 2/3 -> 1.0)")
-    print("   • Alt + F:                     Toggle maximize column width")
-    print("   • Alt + S:                     Split focused window into new column")
-    print("   • Alt + 0:                     Center current column")
-    print("   • Alt + 1..9:                  Switch to Space 1..9")
-    print("   • Alt + Shift + 1..9:          Move focused window to Space 1..9")
-    print("   • Alt + Left-Drag:             Grab & slide ribbon with flick momentum")
-} else {
-    print("⚠️  Warning: Failed to install event tap for keyboard navigation.")
-}
-
-// 5. IPC Server for Remote Control (shuttlectl)
-let user = ProcessInfo.processInfo.environment["USER"] ?? "user"
-let socketPath = "/tmp/shuttle-\(user).sock"
-unlink(socketPath)
-ignoreSIGPIPE()
-
-let ipcServer = IPCServer(path: socketPath) { [controller] line, conn in
-    let responseText = controller.handleCommand(line)
-    let resp = IPCResponse(ok: !responseText.hasPrefix("ERR"), output: responseText)
-    if let data = try? JSONEncoder().encode(resp),
-       let jsonStr = String(data: data, encoding: .utf8) {
-        conn.send(jsonStr)
-    } else {
-        conn.send(responseText)
-    }
-}
-
-DispatchQueue.global(qos: .userInteractive).async {
-    print("🔌 IPC server listening on \(socketPath)")
-    ipcServer.run()
-}
-
-// 6. Graceful Shutdown & Signal Handling
-@Sendable func performShutdown() {
-    print("\n🛑 Shutting down Shuttle daemon...")
-    unlink(socketPath)
-    exit(0)
-}
-
-controller.onShutdown = performShutdown
-
-signal(SIGINT, SIG_IGN)
-signal(SIGTERM, SIG_IGN)
-
-let sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-sigintSource.setEventHandler { performShutdown() }
-sigintSource.resume()
-
-let sigtermSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
-sigtermSource.setEventHandler { performShutdown() }
-sigtermSource.resume()
-
-// 7. 120Hz/60Hz Animation Simulation Timer
-let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.main)
-timer.schedule(deadline: .now(), repeating: .milliseconds(8)) // ~120Hz tick
-var lastTick = CACurrentMediaTime()
-
-timer.setEventHandler { [controller] in
-    let now = CACurrentMediaTime()
-    let dt = now - lastTick
-    lastTick = now
-    controller.tick(dt: dt)
-}
-timer.resume()
-
-print("\n🚀 shuttled daemon ready. Running event loop...")
-RunLoop.main.run()
+let delegate = ShuttleApp()
+app.delegate = delegate
+app.run()

@@ -36,8 +36,16 @@ public struct Strip: Equatable, Sendable {
     public var columns: [Column]
     public var focusedColumnIndex: Int
     public var focusedWindowId: UInt32?
+    /// The window filling the whole display, gaps and all (niri's
+    /// `fullscreen-window`). Its column takes the viewport plus both outer
+    /// gaps on the ribbon, which pushes every neighbour off screen.
+    public var fullscreenWindowId: UInt32?
+    /// A strip with one column lays it out at the full viewport width; the
+    /// column keeps its own width for when a second one arrives.
+    public var fillsWhenAlone = false
 
     public init(columns: [Column] = [], focusedColumnIndex: Int = 0, focusedWindowId: UInt32? = nil) {
+        self.fullscreenWindowId = nil
         self.columns = columns
         self.focusedColumnIndex = focusedColumnIndex
         self.focusedWindowId = focusedWindowId
@@ -46,10 +54,28 @@ public struct Strip: Equatable, Sendable {
         }
     }
 
+    /// The column holding focus, if the strip has any.
+    public var focusedColumn: Column? {
+        columns.indices.contains(focusedColumnIndex) ? columns[focusedColumnIndex] : nil
+    }
+
+    /// Whether `column` holds the fullscreen window.
+    public func isFullscreen(_ column: Column) -> Bool {
+        fullscreenWindowId.map(column.windowIds.contains) ?? false
+    }
+
+    /// A column's width on the ribbon: its own, or the whole display for the
+    /// fullscreen one (`viewportWidth` is the area inside the outer gaps).
+    public func width(of column: Column, viewportWidth: Double, gap: Double) -> Double {
+        if isFullscreen(column) { return viewportWidth + 2 * gap }
+        if fillsWhenAlone && columns.count == 1 { return viewportWidth }
+        return column.width.resolve(viewportWidth: viewportWidth)
+    }
+
     /// Total layout width of the strip given viewport dimensions and gap sizes.
     public func totalWidth(viewportWidth: Double, gap: Double) -> Double {
         guard !columns.isEmpty else { return 0 }
-        let colsWidth = columns.reduce(0.0) { $0 + $1.width.resolve(viewportWidth: viewportWidth) }
+        let colsWidth = columns.reduce(0.0) { $0 + width(of: $1, viewportWidth: viewportWidth, gap: gap) }
         let gapsWidth = Double(columns.count - 1) * gap
         return colsWidth + gapsWidth
     }
@@ -60,18 +86,42 @@ public struct Strip: Equatable, Sendable {
         var current: Double = 0.0
         for col in columns {
             offsets.append(current)
-            current += col.width.resolve(viewportWidth: viewportWidth) + gap
+            current += width(of: col, viewportWidth: viewportWidth, gap: gap) + gap
         }
         return offsets
+    }
+
+    /// Toggles fullscreen for the focused window. Returns false with nothing focused.
+    @discardableResult
+    public mutating func toggleFullscreenFocusedWindow() -> Bool {
+        guard let wid = focusedWindowId else { return false }
+        fullscreenWindowId = fullscreenWindowId == wid ? nil : wid
+        return true
     }
 
     /// Calculates the ribbon offset required to center the specified column in the viewport.
     public func centerOffset(forColumnAt index: Int, viewportWidth: Double, gap: Double) -> Double? {
         let offsets = columnOffsets(viewportWidth: viewportWidth, gap: gap)
         guard index >= 0 && index < offsets.count else { return nil }
-        let colWidth = columns[index].width.resolve(viewportWidth: viewportWidth)
+        let colWidth = width(of: columns[index], viewportWidth: viewportWidth, gap: gap)
         let colCenter = offsets[index] + (colWidth / 2.0)
         return colCenter - (viewportWidth / 2.0)
+    }
+
+    /// The smallest scroll from `currentOffset` that shows the whole column, or
+    /// its center when it is wider than the viewport. niri's
+    /// `center-focused-column "never"`.
+    public func revealOffset(forColumnAt index: Int, currentOffset: Double, viewportWidth: Double, gap: Double) -> Double? {
+        let offsets = columnOffsets(viewportWidth: viewportWidth, gap: gap)
+        guard index >= 0 && index < offsets.count else { return nil }
+        let left = offsets[index]
+        let colWidth = width(of: columns[index], viewportWidth: viewportWidth, gap: gap)
+        if colWidth >= viewportWidth {
+            return left + colWidth / 2.0 - viewportWidth / 2.0
+        }
+        if left < currentOffset { return left }
+        if left + colWidth > currentOffset + viewportWidth { return left + colWidth - viewportWidth }
+        return currentOffset
     }
 
     /// The minimum (leftmost) and maximum (rightmost) center offsets for the strip.
@@ -104,7 +154,7 @@ public struct Strip: Equatable, Sendable {
         var bestDist = Double.greatestFiniteMagnitude
 
         for (idx, col) in columns.enumerated() {
-            let colWidth = col.width.resolve(viewportWidth: viewportWidth)
+            let colWidth = width(of: col, viewportWidth: viewportWidth, gap: gap)
             let colCenter = offsets[idx] + (colWidth / 2.0)
             let dist = abs(colCenter - viewportCenter)
             if dist < bestDist {
@@ -220,7 +270,7 @@ public struct Strip: Equatable, Sendable {
 
     /// Takes the currently focused window from a stacked column and splits it out into its own column.
     @discardableResult
-    public mutating func splitFocusedWindowIntoNewColumn() -> Bool {
+    public mutating func splitFocusedWindowIntoNewColumn(width: ColumnWidth = .proportion(0.5)) -> Bool {
         guard focusedColumnIndex >= 0 && focusedColumnIndex < columns.count else { return false }
         guard columns[focusedColumnIndex].windowIds.count > 1, let wid = focusedWindowId else { return false }
 
@@ -229,7 +279,7 @@ public struct Strip: Equatable, Sendable {
         syncFocusedWindow()
 
         // Insert new column to the right
-        let newCol = Column(windowIds: [wid], width: .proportion(0.5))
+        let newCol = Column(windowIds: [wid], width: width)
         let insertIdx = focusedColumnIndex + 1
         columns.insert(newCol, at: insertIdx)
         focusedColumnIndex = insertIdx
@@ -251,23 +301,29 @@ public struct Strip: Equatable, Sendable {
         if !toRight {
             focusedColumnIndex -= 1
         }
+        if let wid = focusedWindowId, !columns[focusedColumnIndex].windowIds.contains(wid) {
+            syncFocusedWindow()
+        }
         return true
     }
 
     /// Inserts a window into the strip (either in an existing column or creating a new column).
-    public mutating func insertWindow(_ windowID: UInt32, inColumnAt index: Int? = nil, asNewColumn: Bool = true) {
+    public mutating func insertWindow(
+        _ windowID: UInt32, inColumnAt index: Int? = nil, asNewColumn: Bool = true,
+        width: ColumnWidth = .proportion(0.5)
+    ) {
         removeWindow(windowID)
         if asNewColumn {
             let targetIdx = index ?? (columns.isEmpty ? 0 : focusedColumnIndex + 1)
             let clamped = max(0, min(targetIdx, columns.count))
-            let newCol = Column(windowIds: [windowID], width: .proportion(0.5))
+            let newCol = Column(windowIds: [windowID], width: width)
             columns.insert(newCol, at: clamped)
             focusedColumnIndex = clamped
             focusedWindowId = windowID
         } else {
             let targetIdx = index ?? focusedColumnIndex
             guard !columns.isEmpty && targetIdx >= 0 && targetIdx < columns.count else {
-                columns.append(Column(windowIds: [windowID], width: .proportion(0.5)))
+                columns.append(Column(windowIds: [windowID], width: width))
                 focusedColumnIndex = columns.count - 1
                 focusedWindowId = windowID
                 return
@@ -290,6 +346,10 @@ public struct Strip: Equatable, Sendable {
             }
             if columns[colIdx].windowIds.isEmpty {
                 columns.remove(at: colIdx)
+                // A column left of focus going away shifts focus's index, not its column.
+                if colIdx < focusedColumnIndex {
+                    focusedColumnIndex -= 1
+                }
                 if focusedColumnIndex >= columns.count {
                     focusedColumnIndex = max(0, columns.count - 1)
                 }
@@ -299,6 +359,9 @@ public struct Strip: Equatable, Sendable {
         }
         if focusedWindowId == windowID {
             syncFocusedWindow()
+        }
+        if fullscreenWindowId == windowID {
+            fullscreenWindowId = nil
         }
         return removed
     }
@@ -363,9 +426,17 @@ public struct Strip: Equatable, Sendable {
 
         for (colIdx, col) in columns.enumerated() {
             let colX = offsets[colIdx] - ribbonOffset + viewport.x
-            let colW = col.width.resolve(viewportWidth: viewport.width)
+            let colW = width(of: col, viewportWidth: viewport.width, gap: gap)
             let winCount = col.windowIds.count
             guard winCount > 0 else { continue }
+
+            // Fullscreen: every window of the column gets the whole display;
+            // the fullscreen one is raised over the rest.
+            if isFullscreen(col) {
+                let full = Frame(x: colX, y: viewport.y - gap, width: colW, height: viewport.height + 2 * gap)
+                for winID in col.windowIds { result[winID] = full }
+                continue
+            }
 
             // Distribute vertical space in column
             let totalGaps = Double(winCount - 1) * gap

@@ -45,10 +45,18 @@ mkdir -p "$APP_DIR/Contents/MacOS"
 mkdir -p "$APP_DIR/Contents/Resources"
 cp -f "$RELEASE_DIR/shuttled" "$APP_DIR/Contents/MacOS/shuttled"
 cp -f "$REPO_DIR/extra/Info.plist" "$APP_DIR/Contents/Info.plist"
+cp -f "$REPO_DIR/extra/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 
-# Ad-hoc codesign
-echo -e "${YELLOW}▶ Applying ad-hoc codesignature to Shuttle.app...${NC}"
-codesign --force --deep --sign - "$APP_DIR"
+# Codesign. Ad-hoc by default; macOS ties the Accessibility grant to an
+# ad-hoc signature's hash, so every rebuild loses it. Set SHUTTLE_SIGN_IDENTITY
+# to a certificate in your keychain (even a self-signed "Code Signing" one made
+# in Keychain Access) and the grant survives rebuilds.
+if [ -z "$SHUTTLE_SIGN_IDENTITY" ]; then
+    echo -e "${YELLOW}▶ Applying ad-hoc codesignature (re-grant Accessibility after each rebuild; see SHUTTLE_SIGN_IDENTITY)...${NC}"
+else
+    echo -e "${YELLOW}▶ Signing Shuttle.app as '$SHUTTLE_SIGN_IDENTITY'...${NC}"
+fi
+codesign --force --deep --sign "${SHUTTLE_SIGN_IDENTITY:--}" "$APP_DIR"
 
 # 4. Install command line tools
 echo -e "\n${YELLOW}▶ Installing CLI tools (shuttlectl, shuttled)...${NC}"
@@ -93,10 +101,12 @@ done
 
 if [ "$CONNECTED" = true ]; then
     echo -e "\n${BOLD}${GREEN}✅ Shuttle is now running!${NC}"
-    echo -e "${GREEN}• Check your top macOS Menu Bar for the 🚀 Shuttle icon.${NC}"
+    echo -e "${GREEN}• The menu bar shows your desktop number and a block per column.${NC}"
+    echo -e "${GREEN}• Settings… in that menu edits the config visually (or ⌘, from it).${NC}"
     echo -e "${GREEN}• Alt + H/L to scroll ribbon columns.${NC}"
     echo -e "${GREEN}• Alt + R to cycle column width presets.${NC}"
-    echo -e "${GREEN}• Alt + F to toggle full screen column.${NC}"
+    echo -e "${GREEN}• Alt + F maximizes a column; Alt + Shift + F makes the window fullscreen.${NC}"
+    echo -e "${GREEN}• Ctrl + Alt + arrows focus another display; add Shift to take the column along.${NC}"
     echo -e "${GREEN}• Run 'shuttlectl status' anytime to inspect active state.${NC}"
 else
     echo -e "\n${YELLOW}⚠️  Shuttle launched, but waiting for Accessibility permission.${NC}"
