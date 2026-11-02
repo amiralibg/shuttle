@@ -153,7 +153,11 @@ public final class WindowCoordinator: @unchecked Sendable {
     /// still queued for its app.
     public func raiseAndFocus(windowID: UInt32) {
         guard let entry = managed[windowID] else { return }
-        let element = entry.element, pid = entry.pid
+        raiseAndFocus(entry.element, pid: entry.pid)
+    }
+
+    /// The same for a window Shuttle does not lay out.
+    public func raiseAndFocus(_ element: AXUIElement, pid: Int32) {
         queue(for: pid).async {
             _ = AXUIElementPerformAction(element, kAXRaiseAction as CFString)
             _ = AXUIElementSetAttributeValue(element, kAXMainAttribute as CFString, kCFBooleanTrue)

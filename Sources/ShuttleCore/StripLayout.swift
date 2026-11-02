@@ -124,6 +124,14 @@ public struct Strip: Equatable, Sendable {
         return currentOffset
     }
 
+    /// `offset` moved as little as needed to leave no empty space beside the
+    /// columns. A strip narrower than the viewport sits in its middle.
+    public func clampedOffset(_ offset: Double, viewportWidth: Double, gap: Double) -> Double {
+        let slack = totalWidth(viewportWidth: viewportWidth, gap: gap) - viewportWidth
+        if slack <= 0 { return slack / 2.0 }
+        return min(max(offset, 0), slack)
+    }
+
     /// The minimum (leftmost) and maximum (rightmost) center offsets for the strip.
     public func centerOffsetBounds(viewportWidth: Double, gap: Double) -> (min: Double, max: Double)? {
         guard !columns.isEmpty else { return nil }

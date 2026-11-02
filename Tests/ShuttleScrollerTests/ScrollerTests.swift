@@ -187,6 +187,68 @@ import WeftCore
     }
 }
 
+@Suite struct ClosingColumnTests {
+    private func strip(_ count: Int, width: Double = 0.5) -> Strip {
+        Strip(columns: (1...count).map { Column(windowIds: [UInt32($0)], width: .proportion(width)) })
+    }
+
+    @Test(arguments: [CenterMode.always, .never])
+    func closingTheLastColumnBringsBackTheOneBeforeIt(mode: CenterMode) {
+        var s = strip(3)
+        s.focusColumn(at: 2)
+        let scroller = Scroller(centerMode: mode)
+        // Columns two and three on screen: 516..1016 and 1032..1532.
+        scroller.setOffset(532)
+
+        s.removeWindow(3)
+        scroller.fitColumn(at: s.focusedColumnIndex, in: s, viewportWidth: 1000, gap: 16)
+
+        // What is left is 1016 wide, so its right edge meets the viewport's.
+        #expect(s.focusedWindowId == 2)
+        #expect(scroller.targetOffset == 16)
+        #expect(scroller.isSettled == false)
+    }
+
+    @Test func closingKeepsTheFocusedColumnOnScreen() {
+        var s = strip(4)
+        s.focusColumn(at: 3)
+        let scroller = Scroller()
+        scroller.setOffset(1298)
+
+        s.removeWindow(4)
+        scroller.fitColumn(at: s.focusedColumnIndex, in: s, viewportWidth: 1000, gap: 16)
+
+        // Column three spans 1032..1532, and the viewport now ends at 1532.
+        #expect(scroller.targetOffset == 532)
+    }
+
+    @Test func columnsNarrowerThanTheViewportSitInTheMiddle() {
+        var s = strip(3, width: 0.25)
+        s.focusColumn(at: 2)
+        let scroller = Scroller()
+        scroller.setOffset(200)
+
+        s.removeWindow(3)
+        scroller.fitColumn(at: s.focusedColumnIndex, in: s, viewportWidth: 1000, gap: 16)
+
+        // 516 wide in 1000.
+        #expect(scroller.targetOffset == -242)
+    }
+
+    @Test func fullscreenColumnStaysAlignedWithTheDisplay() {
+        var s = strip(3)
+        s.focusColumn(at: 1)
+        s.toggleFullscreenFocusedWindow()
+        let scroller = Scroller()
+
+        s.removeWindow(3)
+        scroller.fitColumn(at: s.focusedColumnIndex, in: s, viewportWidth: 1000, gap: 16)
+
+        // Column two starts at 516; the fullscreen offset is that plus the outer gap.
+        #expect(scroller.targetOffset == 532)
+    }
+}
+
 @Suite struct SingleColumnTests {
     @Test func loneColumnIsCenteredEvenInNeverMode() {
         let strip = Strip(columns: [Column(windowIds: [1])])
