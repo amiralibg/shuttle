@@ -90,6 +90,15 @@ enum WindowDiscovery {
         return (wid, element)
     }
 
+    /// Whether a focused element is a real window. Finder reports the desktop
+    /// itself as focused, and that has to stay where it is.
+    static func isWindow(_ element: AXUIElement) -> Bool {
+        AXUIElementSetMessagingTimeout(element, 0.15)
+        var role: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role) == .success else { return false }
+        return role as? String == kAXWindowRole as String
+    }
+
     /// Every window the WindowServer has, on any desktop, with its owner.
     ///
     /// Not `WorldReader.pid(of:)`: that call passes the window id without

@@ -69,6 +69,8 @@ final class Workspace {
     let scroller: Scroller
     /// Scrolled into place at least once; before that its offset means nothing.
     var placed = false
+    /// When a column last left this ribbon.
+    var shrankAt = -Double.infinity
 
     init(config: ShuttleConfig) {
         scroller = Scroller(strategy: .hybrid, omega: config.springOmega, centerMode: config.centerFocusedColumn)
@@ -262,6 +264,11 @@ final class DaemonController {
         return moving
     }
 
+    /// How long after a column goes the ribbon keeps closing up empty space.
+    /// macOS picks the next window to focus just after a close, and centering
+    /// on that one would open the gap again.
+    private static let closeUpSeconds = 0.6
+
     /// Scrolls a ribbon to its focused column, at once the first time.
     private func reveal(_ key: WorkspaceKey) {
         guard let m = monitor(key.display), let ws = workspaces[key] else { return }
@@ -269,6 +276,8 @@ final class DaemonController {
             let offset = ws.strip.centerOffset(forColumnAt: ws.strip.focusedColumnIndex, viewportWidth: ribbonWidth(m), gap: gap) ?? 0
             ws.scroller.setOffset(offset)
             ws.placed = true
+        } else if CACurrentMediaTime() - ws.shrankAt < Self.closeUpSeconds {
+            ws.scroller.fitColumn(at: ws.strip.focusedColumnIndex, in: ws.strip, viewportWidth: ribbonWidth(m), gap: gap)
         } else {
             ws.scroller.snapToColumn(at: ws.strip.focusedColumnIndex, in: ws.strip, viewportWidth: ribbonWidth(m), gap: gap)
         }
@@ -283,6 +292,7 @@ final class DaemonController {
         let ws = workspace(key)
         var strip = ws.strip
         guard change(&strip) else { return false }
+        if strip.columns.count < ws.strip.columns.count { ws.shrankAt = CACurrentMediaTime() }
         ws.strip = strip
         if shouldReveal { reveal(key) }
         commit(key)
@@ -434,7 +444,7 @@ final class DaemonController {
 
     /// Shows a desktop and focuses its display. A desktop already showing on
     /// its display only moves focus there.
-    func focusDesktop(_ token: String) -> String {
+    func focusDesktop(_ token: String, raiseRibbon: Bool = true) -> String {
         guard let (m, target) = resolveDesktop(token) else {
             return token == "recent" ? "ERR: No previous desktop" : "ERR: No desktop \(describe(token))"
         }
@@ -454,7 +464,7 @@ final class DaemonController {
         }
         focusedDisplay = m.uuid
         // Land with the keyboard on the window last used there.
-        if let wid = current?.ws.strip.focusedWindowId { coordinator.raiseAndFocus(windowID: wid) }
+        if raiseRibbon, let wid = current?.ws.strip.focusedWindowId { coordinator.raiseAndFocus(windowID: wid) }
         changed()
         return "OK: On \(describe(token)) of \(m.name)"
     }
@@ -462,6 +472,9 @@ final class DaemonController {
     /// Sends the focused window to a desktop, on any display. It is laid out
     /// there at once if that desktop is showing; `follow` goes with it.
     func moveFocusedWindow(toDesktop token: String, follow: Bool) -> String {
+        if let window = frontFloatingWindow() {
+            return moveFloating(window, toDesktop: token, follow: follow)
+        }
         guard let (_, sourceKey, ws) = current, let wid = ws.strip.focusedWindowId else { return "ERR: No window focused" }
         guard let (m, target) = resolveDesktop(token) else { return "ERR: No desktop \(describe(token))" }
         let targetKey = WorkspaceKey(space: target, display: m.uuid)
@@ -481,6 +494,56 @@ final class DaemonController {
         if follow {
             _ = focusDesktop(token)
             coordinator.raiseAndFocus(windowID: wid)
+        }
+        changed()
+        return "OK: Moved window \(wid) to \(describe(token))"
+    }
+
+    private struct FloatingWindow {
+        var wid: WindowID
+        var pid: Int32
+        var element: AXUIElement
+        var monitor: Monitor
+    }
+
+    /// The window the user is on, when no ribbon owns it: floating by rule or
+    /// by hand, or a kind Shuttle never tiles. An app can name a focused window
+    /// on a desktop that is not showing; that one is not in front of anybody.
+    private func frontFloatingWindow() -> FloatingWindow? {
+        guard let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier,
+              let (wid, element) = WindowDiscovery.focusedWindow(of: pid),
+              location(of: wid) == nil,
+              WindowDiscovery.isWindow(element)
+        else { return nil }
+        let spaces = SpaceControl.spacesForWindow(wid)
+        let showing = spaces.isEmpty ? focusedMonitor : monitors.first { spaces.contains($0.current) }
+        // On a fullscreen app's space the window is that app's to keep.
+        guard let showing, showing.currentKey != nil else { return nil }
+        return FloatingWindow(wid: wid, pid: pid, element: element, monitor: showing)
+    }
+
+    /// Sends a window no ribbon owns to a desktop. It stays floating there.
+    private func moveFloating(_ window: FloatingWindow, toDesktop token: String, follow: Bool) -> String {
+        guard let (m, target) = resolveDesktop(token) else { return "ERR: No desktop \(describe(token))" }
+        let wid = window.wid
+        if SpaceControl.spacesForWindow(wid).contains(target) { return "OK: Window is already on \(describe(token))" }
+        guard NativeBridge.move([wid], to: target).verdict.complete else {
+            return "ERR: macOS refused to move window \(wid) to \(describe(token))"
+        }
+        // macOS keeps its coordinates, which are off the other display.
+        if m.uuid != window.monitor.uuid, let f = WorldReader.frame(of: wid) {
+            let vp = m.viewport
+            let w = min(f.width, vp.width), h = min(f.height, vp.height)
+            coordinator.place(window.element, pid: window.pid, frame: Frame(
+                x: vp.x + (vp.width - w) / 2, y: vp.y + (vp.height - h) / 2, width: w, height: h
+            ))
+        }
+        if follow {
+            _ = focusDesktop(token, raiseRibbon: false)
+            coordinator.raiseAndFocus(window.element, pid: window.pid)
+        } else if let key = window.monitor.currentKey, let next = workspace(key).strip.focusedWindowId {
+            // The keyboard was on the window that just left.
+            coordinator.raiseAndFocus(windowID: next)
         }
         changed()
         return "OK: Moved window \(wid) to \(describe(token))"

@@ -180,6 +180,15 @@ public final class Scroller: @unchecked Sendable {
         head(to: focusTarget(forColumnAt: index, in: strip, viewportWidth: viewportWidth, gap: gap))
     }
 
+    /// Animates a column into view as `snapToColumn` does, then pulls the ribbon
+    /// back from any empty space beside it, for when a column has just gone.
+    public func fitColumn(at index: Int, in strip: Strip, viewportWidth: Double, gap: Double) {
+        lock.lock()
+        defer { lock.unlock() }
+        let target = focusTarget(forColumnAt: index, in: strip, viewportWidth: viewportWidth, gap: gap)
+        head(to: target.map { strip.clampedOffset($0, viewportWidth: viewportWidth, gap: gap) })
+    }
+
     /// Animates a column to the viewport center, whatever `centerMode` says.
     public func centerColumn(at index: Int, in strip: Strip, viewportWidth: Double, gap: Double) {
         lock.lock()
