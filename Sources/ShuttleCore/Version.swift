@@ -1,7 +1,7 @@
 import Foundation
 
 public enum ShuttleVersion {
-    public static let current = "0.1.0"
+    public static let current = "0.1.1"
 
     public static func isNewer(_ candidate: String, than current: String) -> Bool {
         func parts(_ v: String) -> [Int] {
